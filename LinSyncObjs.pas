@@ -86,8 +86,8 @@ type
 type
   TLSOWaitResult = (wrSignaled,wrTimeout,wrError);
 
-  TLSOLockType = (ltInvalid,ltEvent,ltMutex,ltSemaphore,ltCondVar,ltBarrier,
-                  ltRWLock,ltSimpleEvent,ltAdvancedEVent);
+  TLSOLockType = (ltInvalid,ltSpinLock,ltEvent,ltMutex,ltSemaphore,ltRWLock,
+                  ltCondVar,ltBarrier,ltSimpleEvent,ltAdvancedEVent);
 
 {===============================================================================
     TLinSyncObject - class declaration
@@ -142,7 +142,7 @@ type
     TWrapperLinSynObject - class declaration
 ===============================================================================}
 type
-  TWrapperLinSynObject = class(TLinSyncObject);
+  TWrapperLinSyncObject = class(TLinSyncObject);
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -153,7 +153,31 @@ type
     TImplementorLinSynObject - class declaration
 ===============================================================================}
 type
-  TImplementorLinSynObject = class(TLinSyncObject);
+  TImplementorLinSyncObject = class(TLinSyncObject);
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                    TSpinLock
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TSpinLock - class declaration
+===============================================================================}
+type
+  TSpinLock = class(TWrapperLinSyncObject)
+  protected
+    class Function GetLockType: TLSOLockType; override;
+    procedure ResolveLockPtr; override;
+    procedure InitializeLock(InitializingData: PtrUInt); override;
+    procedure FinalizeLock; override;
+  public
+    procedure LockStrict; virtual;
+    Function Lock: Boolean; virtual;
+    Function TryLockStrict: Boolean; virtual;
+    Function TryLock: Boolean; virtual;
+    procedure UnlockStrict; virtual;
+    Function Unlock: Boolean; virtual;
+  end;
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -164,20 +188,20 @@ type
     TMutex - class declaration
 ===============================================================================}
 type
-  TMutex = class(TWrapperLinSynObject)
+  TMutex = class(TWrapperLinSyncObject)
   protected
     class Function GetLockType: TLSOLockType; override;
     procedure ResolveLockPtr; override;
     procedure InitializeLock(InitializingData: PtrUInt); override;
     procedure FinalizeLock; override;
   public
-    procedure LockMutex; virtual;
-    Function TryLockMutex: Boolean; virtual;
-    Function TimedLockMutex(Timeout: UInt32): TLSOWaitResult; virtual;
-    procedure UnlockMutex; virtual;
-    Function LockMutexSilent: Boolean; virtual;
-    Function TryLockMutexSilent: Boolean; virtual;
-    Function UnlockMutexSilent: Boolean; virtual;
+    procedure LockStrict; virtual;
+    Function Lock: Boolean; virtual;
+    Function TryLockStrict: Boolean; virtual;
+    Function TryLock: Boolean; virtual;
+    Function TimedLock(Timeout: UInt32): TLSOWaitResult; virtual;
+    procedure UnlockStrict; virtual;
+    Function Unlock: Boolean; virtual;
   end;
 
 {===============================================================================
@@ -189,7 +213,7 @@ type
     TSemaphore - class declaration
 ===============================================================================}
 type
-  TSemaphore = class(TWrapperLinSynObject)
+  TSemaphore = class(TWrapperLinSyncObject)
   protected
     fInitialValue:  cUnsigned;
     class Function GetLockType: TLSOLockType; override;
@@ -201,15 +225,45 @@ type
     constructor Create(InitialValue: cUnsigned); overload; virtual;
     constructor Create(const Name: String); override;
     constructor Create; override;
+    Function GetValueStrict: cInt; virtual;
     Function GetValue: cInt; virtual;
-    procedure WaitSemaphore; virtual;
-    Function TryWaitSemaphore: Boolean; virtual;
-    Function TimedWaitSemaphore(Timeout: UInt32): TLSOWaitResult; virtual;
-    procedure PostSemaphore; virtual;
-    Function GetValueSilent: cInt; virtual;
-    Function WaitSemaphoreSilent: Boolean; virtual;
-    Function TryWaitSemaphoreSilent: Boolean; virtual;
-    Function PostSemaphoreSilent: Boolean; virtual;
+    procedure WaitStrict; virtual;
+    Function Wait: Boolean; virtual;
+    Function TryWaitStrict: Boolean; virtual;
+    Function TryWait: Boolean; virtual;
+    Function TimedWait(Timeout: UInt32): TLSOWaitResult; virtual;
+    procedure PostStrict; virtual;
+    Function Post: Boolean; virtual;
+  end;
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                 TReadWriteLock
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TReadWriteLock - class declaration
+===============================================================================}
+type
+  TReadWriteLock = class(TWrapperLinSyncObject)
+  protected
+    class Function GetLockType: TLSOLockType; override;
+    procedure ResolveLockPtr; override;
+    procedure InitializeLock(InitializingData: PtrUInt); override;
+    procedure FinalizeLock; override;
+  public
+    procedure ReadLockStrict; virtual;
+    Function ReadLock: Boolean; virtual;
+    Function TryReadLockStrict: Boolean; virtual;
+    Function TryReadLock: Boolean; virtual;
+    Function TimedReadLock(Timeout: UInt32): TLSOWaitResult; virtual;
+    procedure WriteLockStrict; virtual;
+    Function WriteLock: Boolean virtual;
+    Function TryWriteLockStrict: Boolean; virtual;
+    Function TryWriteLock: Boolean; virtual;
+    Function TimedWriteLock(Timeout: UInt32): TLSOWaitResult; virtual;
+    procedure UnlockStrict; virtual;  // there is no read- or write-specific unlock
+    Function Unlock: Boolean; virtual;
   end;
 
 {===============================================================================
@@ -388,14 +442,15 @@ type
     SharedUserData: TLSOSharedUserData;
     RefCount:       Int32;
     case LockType: TLSOLockType of
+      ltSpinLock:       (SpinLock:      pthread_spinlock_t);
+      ltSimpleEvent:    (SimpleEvent:   TLSOSimpleEvent);
       ltEvent:          (Event:         TLSOEvent);
+      ltAdvancedEVent:  (AdvancedEvent: TLSOAdvancedEvent);
       ltMutex:          (Mutex:         pthread_mutex_t);
       ltSemaphore:      (Semaphore:     sem_t);
+      ltRWLock:         (RWLock:        pthread_rwlock_t);
       ltCondVar:        (CondVar:       pthread_cond_t);
       ltBarrier:        (Barrier:       pthread_barrier_t);
-      ltRWLock:         (RWLock:        pthread_rwlock_t);
-      ltSimpleEvent:    (SimpleEvent:   TLSOSimpleEvent);
-      ltAdvancedEVent:  (AdvancedEvent: TLSOAdvancedEvent)
   end;
   PLSOSharedData = ^TLSOSharedData;
 
@@ -619,6 +674,114 @@ end;
 
 {===============================================================================
 --------------------------------------------------------------------------------
+                                    TSpinLock
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TSpinLock - class implementation
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TSpinLock - protected methods
+-------------------------------------------------------------------------------}
+
+class Function TSpinLock.GetLockType: TLSOLockType;
+begin
+Result := ltSpinLock;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSpinLock.ResolveLockPtr;
+begin
+fLockPtr := Addr(PLSOSharedData(fSharedData)^.SpinLock);
+end;
+
+//------------------------------------------------------------------------------
+
+{$IFDEF FPCDWM}{$PUSH}W5024{$ENDIF}
+procedure TSpinLock.InitializeLock(InitializingData: PtrUInt);
+var
+  ProcShared: cInt;
+begin
+If fProcessShared then
+  ProcShared := PTHREAD_PROCESS_SHARED
+else
+  ProcShared := PTHREAD_PROCESS_PRIVATE;
+If not CheckResErr(pthread_spin_init(Addr(PLSOSharedData(fSharedData)^.SpinLock),ProcShared)) then
+  raise ELSOSysInitError.CreateFmt('TSpinLock.InitializeLock: ' +
+    'Failed to initialize spinlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
+
+//------------------------------------------------------------------------------
+
+procedure TSpinLock.FinalizeLock;
+begin
+If not CheckResErr(pthread_spin_destroy(Addr(PLSOSharedData(fSharedData)^.SpinLock))) then
+  raise ELSOSysFinalError.CreateFmt('TSpinLock.FinalizeLock: ' +
+    'Failed to destroy spinlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+{-------------------------------------------------------------------------------
+    TSpinLock - public methods
+-------------------------------------------------------------------------------}
+
+procedure TSpinLock.LockStrict;
+begin
+If not CheckResErr(pthread_spin_lock(fLockPtr)) then
+  raise ELSOSysOpError.CreateFmt('TSpinLock.LockStrict: ' +
+    'Failed to lock spinlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSpinLock.Lock: Boolean;
+begin
+Result := CheckResErr(pthread_spin_lock(fLockPtr));
+fLastError := Integer(ThrErrorCode);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSpinLock.TryLockStrict: Boolean;
+begin
+Result := CheckResErr(pthread_spin_trylock(fLockPtr));
+If not Result and (ThrErrorCode <> ESysEBUSY) then
+  raise ELSOSysOpError.CreateFmt('TSpinLock.TryLockStrict: ' +
+    'Failed to try-lock spinlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSpinLock.TryLock: Boolean;
+begin
+Result := CheckResErr(pthread_spin_trylock(fLockPtr));
+If not Result and (ThrErrorCode = ESysEBUSY) then
+  fLastError := 0
+else
+  fLastError := Integer(ThrErrorCode);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSpinLock.UnlockStrict;
+begin
+If not CheckResErr(pthread_spin_unlock(fLockPtr)) then
+  raise ELSOSysOpError.CreateFmt('TSpinLock.UnlockStrict: ' +
+    'Failed to unlock spinlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSpinLock.Unlock: Boolean;
+begin
+Result := CheckResErr(pthread_spin_unlock(fLockPtr));
+fLastError := Integer(ThrErrorCode);
+end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
                                      TMutex
 --------------------------------------------------------------------------------
 ===============================================================================}
@@ -686,26 +849,45 @@ end;
     TMutex - public methods
 -------------------------------------------------------------------------------}
 
-procedure TMutex.LockMutex;
+procedure TMutex.LockStrict;
 begin
 If not CheckResErr(pthread_mutex_lock(fLockPtr)) then
-  raise ELSOSysOpError.CreateFmt('TMutex.LockMutex: ' +
+  raise ELSOSysOpError.CreateFmt('TMutex.LockStrict: ' +
     'Failed to lock mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TMutex.TryLockMutex: Boolean;
+Function TMutex.Lock: Boolean;
+begin
+Result := CheckResErr(pthread_mutex_lock(fLockPtr));
+fLastError := Integer(ThrErrorCode);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMutex.TryLockStrict: Boolean;
 begin
 Result := CheckResErr(pthread_mutex_trylock(fLockPtr));
 If not Result and (ThrErrorCode <> ESysEBUSY) then
-  raise ELSOSysOpError.CreateFmt('TMutex.TryLockMutex: ' +
+  raise ELSOSysOpError.CreateFmt('TMutex.TryLockStrict: ' +
     'Failed to try-lock mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TMutex.TimedLockMutex(Timeout: UInt32): TLSOWaitResult;
+Function TMutex.TryLock: Boolean;
+begin
+Result := CheckResErr(pthread_mutex_trylock(fLockPtr));
+If not Result and (ThrErrorCode = ESysEBUSY) then
+  fLastError := 0
+else
+  fLastError := Integer(ThrErrorCode);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMutex.TimedLock(Timeout: UInt32): TLSOWaitResult;
 var
   TimeoutSpec:  timespec;
 begin
@@ -724,35 +906,16 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TMutex.UnlockMutex;
+procedure TMutex.UnlockStrict;
 begin
 If not CheckResErr(pthread_mutex_unlock(fLockPtr)) then
-  raise ELSOSysOpError.CreateFmt('TMutex.UnlockMutex: ' +
+  raise ELSOSysOpError.CreateFmt('TMutex.UnlockStrict: ' +
     'Failed to unlock mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TMutex.LockMutexSilent: Boolean;
-begin
-Result := CheckResErr(pthread_mutex_lock(fLockPtr));
-fLastError := Integer(ThrErrorCode);
-end;
-
-//------------------------------------------------------------------------------
-
-Function TMutex.TryLockMutexSilent: Boolean;
-begin
-Result := CheckResErr(pthread_mutex_trylock(fLockPtr));
-If not Result and (ThrErrorCode = ESysEBUSY) then
-  fLastError := 0
-else
-  fLastError := Integer(ThrErrorCode);
-end;
-
-//------------------------------------------------------------------------------
-
-Function TMutex.UnlockMutexSilent: Boolean;
+Function TMutex.Unlock: Boolean;
 begin
 Result := CheckResErr(pthread_mutex_unlock(fLockPtr));
 fLastError := Integer(ThrErrorCode);
@@ -833,16 +996,27 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TSemaphore.GetValue: cInt;
+Function TSemaphore.GetValueStrict: cInt;
 begin
 If not CheckErrAlt(sem_getvalue(fLockPtr,@Result)) then
-  raise ELSOSysOpError.CreateFmt('TSemaphore.GetValue: ' +
-    'Failed toget  semaphore value (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+  raise ELSOSysOpError.CreateFmt('TSemaphore.GetValueStrict: ' +
+    'Failed to get  semaphore value (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TSemaphore.WaitSemaphore;
+Function TSemaphore.GetValue: cInt;
+begin
+If not CheckErrAlt(sem_getvalue(fLockPtr,@Result)) then
+  begin
+    fLastError := ThrErrorCode;
+    Result := -1;
+  end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSemaphore.WaitStrict;
 var
   ExitWait: Boolean;
 begin
@@ -853,7 +1027,7 @@ repeat
       If ThrErrorCode = ESysEINTR then
         ExitWait := False
       else
-        raise ELSOSysOpError.CreateFmt('TSemaphore.WaitSemaphore: ' +
+        raise ELSOSysOpError.CreateFmt('TSemaphore.WaitStrict: ' +
           'Failed to wait on semaphore (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
     end;
 until ExitWait;
@@ -861,7 +1035,20 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TSemaphore.TryWaitSemaphore: Boolean;
+Function TSemaphore.Wait: Boolean;
+var
+  ExitWait: Boolean;
+begin
+repeat
+  Result := CheckErrAlt(sem_wait(fLockPtr));
+  ExitWait := Result or (ThrErrorCode <> ESysEINTR);
+until ExitWait;
+fLastError := Integer(ThrErrorCode);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSemaphore.TryWaitStrict: Boolean;
 var
   ExitWait: Boolean;
 begin
@@ -873,7 +1060,7 @@ repeat
       ESysEINTR:  ExitWait := False;
       ESysEAGAIN:;// do nothing (exit with result being false)
     else
-      raise ELSOSysOpError.CreateFmt('TSemaphore.TryWaitSemaphore: ' +
+      raise ELSOSysOpError.CreateFmt('TSemaphore.TryWaitStrict: ' +
         'Failed to try-wait on semaphore (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
     end;
 until ExitWait;
@@ -881,7 +1068,23 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TSemaphore.TimedWaitSemaphore(Timeout: UInt32): TLSOWaitResult;
+Function TSemaphore.TryWait: Boolean;
+var
+  ExitWait: Boolean;
+begin
+repeat
+  Result := CheckErrAlt(sem_trywait(fLockPtr));
+  ExitWait := Result or (ThrErrorCode <> ESysEINTR);
+until ExitWait;
+If not Result and (ThrErrorCode = ESysEAGAIN) then
+  fLastError := 0
+else
+  fLastError := Integer(ThrErrorCode);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSemaphore.TimedWait(Timeout: UInt32): TLSOWaitResult;
 var
   TimeoutSpec:  timespec;
   ExitWait:     Boolean;
@@ -903,48 +1106,116 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TSemaphore.PostSemaphore;
+procedure TSemaphore.PostStrict;
 begin
 If not CheckErrAlt(sem_post(fLockPtr)) then
-  raise ELSOSysOpError.CreateFmt('TSemaphore.PostSemaphore: ' +
+  raise ELSOSysOpError.CreateFmt('TSemaphore.PostStrict: ' +
     'Failed to post semaphore (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TSemaphore.GetValueSilent: cInt;
+Function TSemaphore.Post: Boolean;
 begin
-If not CheckErrAlt(sem_getvalue(fLockPtr,@Result)) then
-  begin
-    fLastError := ThrErrorCode;
-    Result := -1;
-  end;
+Result := CheckErrAlt(sem_post(fLockPtr));
+fLastError := Integer(ThrErrorCode);
+end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                 TReadWriteLock
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TReadWriteLock - class implementation
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TReadWriteLock - protected methods
+-------------------------------------------------------------------------------}
+
+class Function TReadWriteLock.GetLockType: TLSOLockType;
+begin
+Result := ltRWLock;
 end;
 
 //------------------------------------------------------------------------------
 
-Function TSemaphore.WaitSemaphoreSilent: Boolean;
-var
-  ExitWait: Boolean;
+procedure TReadWriteLock.ResolveLockPtr;
 begin
-repeat
-  Result := CheckErrAlt(sem_wait(fLockPtr));
-  ExitWait := Result or (ThrErrorCode <> ESysEINTR);
-until ExitWait;
+fLockPtr := Addr(PLSOSharedData(fSharedData)^.RWLock);
+end;
+
+//------------------------------------------------------------------------------
+
+{$IFDEF FPCDWM}{$PUSH}W5024{$ENDIF}
+procedure TReadWriteLock.InitializeLock(InitializingData: PtrUInt);
+var
+  RWLockAttr: pthread_rwlockattr_t;
+begin
+If CheckResErr(pthread_rwlockattr_init(@RWLockAttr)) then
+  try
+    If fProcessShared then
+      If not CheckResErr(pthread_rwlockattr_setpshared(@RWLockAttr,PTHREAD_PROCESS_SHARED)) then
+        raise ELSOSysOpError.CreateFmt('TRWLock.InitializeLock: ' +
+          'Failed to set rwlock attribute PSHARED (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+    If not CheckResErr(pthread_rwlock_init(Addr(PLSOSharedData(fSharedData)^.RWLock),@RWLockAttr)) then
+      raise ELSOSysInitError.CreateFmt('TRWLock.InitializeLock: ' +
+        'Failed to initialize rwlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+  finally
+    If not CheckResErr(pthread_rwlockattr_destroy(@RWLockAttr)) then
+      raise ELSOSysFinalError.CreateFmt('TRWLock.InitializeLock: ' +
+        'Failed to destroy rwlock attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+  end
+else raise ELSOSysInitError.CreateFmt('TRWLock.InitializeLock: ' +
+       'Failed to initialize rwlock attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
+
+//------------------------------------------------------------------------------
+
+procedure TReadWriteLock.FinalizeLock;
+begin
+If not CheckResErr(pthread_rwlock_destroy(Addr(PLSOSharedData(fSharedData)^.RWLock))) then
+  raise ELSOSysFinalError.CreateFmt('TRWLock.FinalizeLock: ' +
+    'Failed to destroy rwlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+{-------------------------------------------------------------------------------
+    TRWLock - public methods
+-------------------------------------------------------------------------------}
+
+procedure TReadWriteLock.ReadLockStrict;
+begin
+If not CheckResErr(pthread_rwlock_rdlock(fLockPtr)) then
+  raise ELSOSysOpError.CreateFmt('TRWLock.ReadLockStrict: ' +
+    'Failed to read-lock rwlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TReadWriteLock.ReadLock: Boolean;
+begin
+Result := CheckResErr(pthread_rwlock_rdlock(fLockPtr));
 fLastError := Integer(ThrErrorCode);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TSemaphore.TryWaitSemaphoreSilent: Boolean;
-var
-  ExitWait: Boolean;
+Function TReadWriteLock.TryReadLockStrict: Boolean;
 begin
-repeat
-  Result := CheckErrAlt(sem_trywait(fLockPtr));
-  ExitWait := Result or (ThrErrorCode <> ESysEINTR);
-until ExitWait;
-If not Result and (ThrErrorCode = ESysEAGAIN) then
+Result := CheckResErr(pthread_rwlock_tryrdlock(fLockPtr));
+If not Result and (ThrErrorCode <> ESysEBUSY) then
+  raise ELSOSysOpError.CreateFmt('TRWLock.TryReadLockStrict: ' +
+    'Failed to try-read-lock rwlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TReadWriteLock.TryReadLock: Boolean;
+begin
+Result := CheckResErr(pthread_rwlock_tryrdlock(fLockPtr));
+If not Result and (ThrErrorCode = ESysEBUSY) then
   fLastError := 0
 else
   fLastError := Integer(ThrErrorCode);
@@ -952,9 +1223,94 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TSemaphore.PostSemaphoreSilent: Boolean;
+Function TReadWriteLock.TimedReadLock(Timeout: UInt32): TLSOWaitResult;
+var
+  TimeoutSpec:  timespec;
 begin
-Result := CheckErrAlt(sem_post(fLockPtr));
+ResolveTimeout(Timeout,TimeoutSpec);
+If not CheckResErr(pthread_rwlock_timedrdlock(fLockPtr,@TimeoutSpec)) then
+  begin
+    If ThrErrorCode <> ESysETIMEDOUT then
+      begin
+        Result := wrError;
+        fLastError := Integer(ThrErrorCode);
+      end
+    else Result := wrTimeout;
+  end
+else Result := wrSignaled;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TReadWriteLock.WriteLockStrict;
+begin
+If not CheckResErr(pthread_rwlock_wrlock(fLockPtr)) then
+  raise ELSOSysOpError.CreateFmt('TRWLock.WriteLockStrict: ' +
+    'Failed to write-lock rwlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TReadWriteLock.WriteLock: Boolean;
+begin
+Result := CheckResErr(pthread_rwlock_wrlock(fLockPtr));
+fLastError := Integer(ThrErrorCode);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TReadWriteLock.TryWriteLockStrict: Boolean;
+begin
+Result := CheckResErr(pthread_rwlock_trywrlock(fLockPtr));
+If not Result and (ThrErrorCode <> ESysEBUSY) then
+  raise ELSOSysOpError.CreateFmt('TRWLock.TryWriteLockStrict: ' +
+    'Failed to try-write-lock rwlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TReadWriteLock.TryWriteLock: Boolean;
+begin
+Result := CheckResErr(pthread_rwlock_trywrlock(fLockPtr));
+If not Result and (ThrErrorCode = ESysEBUSY) then
+  fLastError := 0
+else
+  fLastError := Integer(ThrErrorCode);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TReadWriteLock.TimedWriteLock(Timeout: UInt32): TLSOWaitResult;
+var
+  TimeoutSpec:  timespec;
+begin
+ResolveTimeout(Timeout,TimeoutSpec);
+If not CheckResErr(pthread_rwlock_timedwrlock(fLockPtr,@TimeoutSpec)) then
+  begin
+    If ThrErrorCode <> ESysETIMEDOUT then
+      begin
+        Result := wrError;
+        fLastError := Integer(ThrErrorCode);
+      end
+    else Result := wrTimeout;
+  end
+else Result := wrSignaled;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TReadWriteLock.UnlockStrict;
+begin
+If not CheckResErr(pthread_rwlock_unlock(fLockPtr)) then
+  raise ELSOSysOpError.CreateFmt('TRWLock.UnlockStrict: ' +
+    'Failed to unlock rwlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TReadWriteLock.Unlock: Boolean;
+begin
+Result := CheckResErr(pthread_rwlock_unlock(fLockPtr));
 fLastError := Integer(ThrErrorCode);
 end;
 
