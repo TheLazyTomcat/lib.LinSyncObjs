@@ -201,12 +201,12 @@ type
     constructor Create(InitialValue: cUnsigned); overload; virtual;
     constructor Create(const Name: String); override;
     constructor Create; override;
-    //procedure GetValue(out Value: cInt); virtual;
+    Function GetValue: cInt; virtual;
     procedure WaitSemaphore; virtual;
     Function TryWaitSemaphore: Boolean; virtual;
     Function TimedWaitSemaphore(Timeout: UInt32): TLSOWaitResult; virtual;
     procedure PostSemaphore; virtual;
-    //Function GetValueSilent(out Value: cInt): Boolean; virtual;
+    Function GetValueSilent: cInt; virtual;
     Function WaitSemaphoreSilent: Boolean; virtual;
     Function TryWaitSemaphoreSilent: Boolean; virtual;
     Function PostSemaphoreSilent: Boolean; virtual;
@@ -833,6 +833,15 @@ end;
 
 //------------------------------------------------------------------------------
 
+Function TSemaphore.GetValue: cInt;
+begin
+If not CheckErrAlt(sem_getvalue(fLockPtr,@Result)) then
+  raise ELSOSysOpError.CreateFmt('TSemaphore.GetValue: ' +
+    'Failed toget  semaphore value (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
 procedure TSemaphore.WaitSemaphore;
 var
   ExitWait: Boolean;
@@ -899,6 +908,17 @@ begin
 If not CheckErrAlt(sem_post(fLockPtr)) then
   raise ELSOSysOpError.CreateFmt('TSemaphore.PostSemaphore: ' +
     'Failed to post semaphore (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSemaphore.GetValueSilent: cInt;
+begin
+If not CheckErrAlt(sem_getvalue(fLockPtr,@Result)) then
+  begin
+    fLastError := ThrErrorCode;
+    Result := -1;
+  end;
 end;
 
 //------------------------------------------------------------------------------
