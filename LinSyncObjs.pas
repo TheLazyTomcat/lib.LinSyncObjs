@@ -9,6 +9,8 @@ unit LinSyncObjs;
 {$IFDEF FPC}
   {$MODE ObjFPC}
   {$MODESWITCH DuplicateLocals+}
+  {$DEFINE FPC_DisableWarns}
+  {$MACRO ON}
 {$ENDIF}
 {$H+}
 
@@ -17,6 +19,11 @@ interface
 uses
   SysUtils, BaseUnix,
   AuxTypes, AuxClasses, NamedSharedItems;
+
+{$IFDEF FPC_DisableWarns}
+  {$DEFINE FPCDWM}
+  {$DEFINE W3018:={$WARN 3018 OFF}} // Constructor should be public
+{$ENDIF}
 
 {===============================================================================
     Library-specific exceptions
@@ -29,9 +36,9 @@ type
   ELSOSysFinalError = class(ELSOException);
   ELSOSysOpError    = class(ELSOException);
 
-  ELSOOpenError      = class(ELSOException);
-  ELSInvalidLockType = class(ELSOException);
-  ELSInvalidObject   = class(ELSOException);
+  ELSOOpenError       = class(ELSOException);
+  ELSOInvalidLockType = class(ELSOException);
+  ELSOInvalidObject   = class(ELSOException);
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -102,15 +109,20 @@ type
     class Function GetLockType: TLSOLockType; virtual; abstract;
     procedure CheckAndSetLockType; virtual;
     procedure ResolveLockPtr; virtual; abstract;
-    procedure InitializeLock; virtual; abstract;
+    procedure InitializeLock(InitializingData: PtrUInt); virtual; abstract;
     procedure FinalizeLock; virtual; abstract;
     // object initialization/finalization
-    procedure Initialize(const Name: String); virtual;
+    procedure Initialize(const Name: String; InitializingData: PtrUInt); overload; virtual;
+    // following overload can be used only to open existing process-shared objects
+    procedure Initialize(const Name: String); overload; virtual;
     procedure Finalize; virtual;
+  {$IFDEF FPCDWM}{$PUSH}W3018{$ENDIF}
+    constructor ProtectedCreate(const Name: String; InitializingData: PtrUInt); virtual;
+  {$IFDEF FPCDWM}{$POP}{$ENDIF}
   public
     constructor Create(const Name: String); overload; virtual;
     constructor Create; overload; virtual;
-    constructor Open(const Name: String{$IFNDEF FPC}; Dummy: Integer = 0{$ENDIF}); virtual;
+    constructor Open(const Name: String); virtual;
     constructor DuplicateFrom(SourceObject: TLinSyncObject); virtual;
     destructor Destroy; override;
     // properties
@@ -156,16 +168,48 @@ type
   protected
     class Function GetLockType: TLSOLockType; override;
     procedure ResolveLockPtr; override;
-    procedure InitializeLock; override;
+    procedure InitializeLock(InitializingData: PtrUInt); override;
     procedure FinalizeLock; override;
   public
-    Function TimedLockMutex(Timeout: UInt32): TLSOWaitResult; virtual;
     procedure LockMutex; virtual;
     Function TryLockMutex: Boolean; virtual;
+    Function TimedLockMutex(Timeout: UInt32): TLSOWaitResult; virtual;
     procedure UnlockMutex; virtual;
     Function LockMutexSilent: Boolean; virtual;
     Function TryLockMutexSilent: Boolean; virtual;
     Function UnlockMutexSilent: Boolean; virtual;
+  end;
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                   TSemaphore
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TSemaphore - class declaration
+===============================================================================}
+type
+  TSemaphore = class(TWrapperLinSynObject)
+  protected
+    fInitialValue:  cUnsigned;
+    class Function GetLockType: TLSOLockType; override;
+    procedure ResolveLockPtr; override;
+    procedure InitializeLock(InitializingData: PtrUInt); override;
+    procedure FinalizeLock; override;
+  public
+    constructor Create(const Name: String; InitialValue: cUnsigned); overload; virtual;
+    constructor Create(InitialValue: cUnsigned); overload; virtual;
+    constructor Create(const Name: String); override;
+    constructor Create; override;
+    //procedure GetValue(out Value: cInt); virtual;
+    procedure WaitSemaphore; virtual;
+    Function TryWaitSemaphore: Boolean; virtual;
+    Function TimedWaitSemaphore(Timeout: UInt32): TLSOWaitResult; virtual;
+    procedure PostSemaphore; virtual;
+    //Function GetValueSilent(out Value: cInt): Boolean; virtual;
+    Function WaitSemaphoreSilent: Boolean; virtual;
+    Function TryWaitSemaphoreSilent: Boolean; virtual;
+    Function PostSemaphoreSilent: Boolean; virtual;
   end;
 
 {===============================================================================
@@ -185,16 +229,47 @@ uses
   UnixType, Linux, pThreads, Errors,
   InterlockedOps;
 
+{$IFDEF FPC_DisableWarns}
+  {$DEFINE FPCDWM}
+  {$DEFINE W5024:={$WARN 5024 OFF}} // Parameter "$1" not used
+{$ENDIF}
+
+//------------------------------------------------------------------------------
+
 threadvar
   ThrErrorCode: cInt;
 
-Function CheckErr(ErrorCode: cInt): Boolean;
+Function CheckResErr(ReturnedValue: cInt): Boolean;
 begin
-Result := ErrorCode = 0;
+Result := ReturnedValue = 0;
 If Result then
   ThrErrorCode := 0
 else
-  ThrErrorCode := ErrorCode;
+  ThrErrorCode := ReturnedValue;
+end;
+
+//--  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
+
+Function CheckErr(ReturnedValue: cInt): Boolean;
+begin
+Result := ReturnedValue = 0;
+If Result then
+  ThrErrorCode := 0
+else
+  ThrErrorCode := errno;
+end;
+
+//--  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
+
+Function errno_ptr: pcInt; cdecl; external name '__errno_location';
+
+Function CheckErrAlt(ReturnedValue: cInt): Boolean;
+begin
+Result := ReturnedValue = 0;
+If Result then
+  ThrErrorCode := 0
+else
+  ThrErrorCode := errno_ptr^;
 end;
 
 {===============================================================================
@@ -213,16 +288,16 @@ procedure TCriticalSection.Initialize;
 var
   MutexAttr:  pthread_mutexattr_t;
 begin
-If CheckErr(pthread_mutexattr_init(@MutexAttr)) then
+If CheckResErr(pthread_mutexattr_init(@MutexAttr)) then
   try
-    If not CheckErr(pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE)) then
+    If not CheckResErr(pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE)) then
       raise ELSOSysOpError.CreateFmt('TCriticalSection.Initialize: ' +
         'Failed to set mutex attribute TYPE (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
-    If not CheckErr(pthread_mutex_init(@fMutex,@MutexAttr)) then
+    If not CheckResErr(pthread_mutex_init(@fMutex,@MutexAttr)) then
       raise ELSOSysInitError.CreateFmt('TCriticalSection.Initialize: ' +
         'Failed to initialize mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
   finally
-    If not CheckErr(pthread_mutexattr_destroy(@MutexAttr)) then
+    If not CheckResErr(pthread_mutexattr_destroy(@MutexAttr)) then
       raise ELSOSysFinalError.CreateFmt('TCriticalSection.Initialize: ' +
         'Failed to destroy mutex attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
   end
@@ -234,7 +309,7 @@ end;
 
 procedure TCriticalSection.Finalize;
 begin
-If not CheckErr(pthread_mutex_destroy(@fMutex)) then
+If not CheckResErr(pthread_mutex_destroy(@fMutex)) then
   raise ELSOSysFinalError.CreateFmt('TCriticalSection.Finalize: ' +
     'Failed to destroy mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
@@ -259,25 +334,18 @@ end;
 //------------------------------------------------------------------------------
 
 Function TCriticalSection.TryEnter: Boolean;
-var
-  LockResult: cInt;
 begin
-LockResult := pthread_mutex_trylock(@fMutex);
-If LockResult <> 0 then
-  begin
-    Result := False;
-    If LockResult <> ESysEBUSY then
-      raise ELSOSysOpError.CreateFmt('TCriticalSection.TryEnter: ' +
-        'Failed to try-lock mutex (%d - %s).',[LockResult,StrError(LockResult)]);
-  end
-else Result := True;
+Result := CheckResErr(pthread_mutex_trylock(@fMutex));
+If not Result and (ThrErrorCode <> ESysEBUSY) then
+  raise ELSOSysOpError.CreateFmt('TCriticalSection.TryEnter: ' +
+    'Failed to try-lock mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
 
 //------------------------------------------------------------------------------
 
 procedure TCriticalSection.Enter;
 begin
-If not CheckErr(pthread_mutex_lock(@fMutex)) then
+If not CheckResErr(pthread_mutex_lock(@fMutex)) then
   raise ELSOSysOpError.CreateFmt('TCriticalSection.Enter: ' +
     'Failed to lock mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
@@ -286,7 +354,7 @@ end;
 
 procedure TCriticalSection.Leave;
 begin
-If not CheckErr(pthread_mutex_unlock(@fMutex)) then
+If not CheckResErr(pthread_mutex_unlock(@fMutex)) then
   raise ELSOSysOpError.CreateFmt('TCriticalSection.Leave: ' +
     'Failed to unlock mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
@@ -322,7 +390,7 @@ type
     case LockType: TLSOLockType of
       ltEvent:          (Event:         TLSOEvent);
       ltMutex:          (Mutex:         pthread_mutex_t);
-      ltSemaphore:      (Semapthore:    sem_t);
+      ltSemaphore:      (Semaphore:     sem_t);
       ltCondVar:        (CondVar:       pthread_cond_t);
       ltBarrier:        (Barrier:       pthread_barrier_t);
       ltRWLock:         (RWLock:        pthread_rwlock_t);
@@ -333,16 +401,17 @@ type
 
 //------------------------------------------------------------------------------
 
-procedure ResolveTimeout(Timeout: UInt32; out TimeSpec: timespec);
+procedure ResolveTimeout(Timeout: UInt32; out TimeoutSpec: timespec);
 begin
-If clock_gettime(CLOCK_REALTIME,@TimeSpec) <> 0 then
-  ELSOSysOpError.CreateFmt('ResolveTimeout: Failed to obtain current time (%d).',[errno]);
-TimeSpec.tv_sec := TimeSpec.tv_sec + time_t(Timeout div 1000);
-TimeSpec.tv_nsec := TimeSpec.tv_nsec + clong((Timeout mod 1000) * 1000000);
-If TimeSpec.tv_nsec > 1000000000 then
+If not CheckErr(clock_gettime(CLOCK_REALTIME,@TimeoutSpec)) then
+  raise ELSOSysOpError.CreateFmt('ResolveTimeout: ' +
+    'Failed to obtain current time (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+TimeoutSpec.tv_sec := TimeoutSpec.tv_sec + time_t(Timeout div 1000);
+TimeoutSpec.tv_nsec := TimeoutSpec.tv_nsec + clong((Timeout mod 1000) * 1000000);
+If TimeoutSpec.tv_nsec > 1000000000 then
   begin
-    Inc(TimeSpec.tv_sec);
-    TimeSpec.tv_nsec := TimeSpec.tv_nsec - 1000000000;
+    Inc(TimeoutSpec.tv_sec);
+    TimeoutSpec.tv_nsec := TimeoutSpec.tv_nsec - 1000000000;
   end;
 end;
 
@@ -379,7 +448,7 @@ begin
 If PLSOSharedData(fSharedData)^.LockType <> ltInvalid then
   begin
     If PLSOSharedData(fSharedData)^.LockType <> GetLockType then
-      raise ELSInvalidLockType.CreateFmt('TLinSyncObject.CheckAndSetLockType: ' +
+      raise ELSOInvalidLockType.CreateFmt('TLinSyncObject.CheckAndSetLockType: ' +
         'Existing lock is of incompatible type (%d)',[Ord(PLSOSharedData(fSharedData)^.LockType)]);
   end
 else PLSOSharedData(fSharedData)^.LockType := GetLockType;
@@ -387,7 +456,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TLinSyncObject.Initialize(const Name: String);
+procedure TLinSyncObject.Initialize(const Name: String; InitializingData: PtrUInt);
 begin
 fLastError := 0;
 fName := Name;
@@ -402,7 +471,7 @@ If fProcessShared then
       CheckAndSetLockType;
       Inc(PLSOSharedData(fSharedData)^.RefCount);
       If PLSOSharedData(fSharedData)^.RefCount <= 1 then
-        InitializeLock;
+        InitializeLock(InitializingData);
     finally
       fNamedSharedItem.GlobalUnlock;
     end;
@@ -412,9 +481,34 @@ else
     fSharedData := AllocMem(SizeOf(TLSOSharedData));
     CheckAndSetLockType;
     InterlockedStore(PLSOSharedData(fSharedData)^.RefCount,1);
-    InitializeLock;
+    InitializeLock(InitializingData);
   end;
 ResolveLockPtr;
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+procedure TLinSyncObject.Initialize(const Name: String);
+begin
+If Length(Name) > 0 then
+  begin
+    fLastError := 0;
+    fName := Name;
+    fProcessShared := True;
+    fNamedSharedItem := TNamedSharedItem.Create(fName,SizeOf(TLSOSharedData),LSO_SHARED_NAMESPACE);
+    fSharedData := fNamedSharedItem.Memory;
+    fNamedSharedItem.GlobalLock;
+    try
+      CheckAndSetLockType;
+      Inc(PLSOSharedData(fSharedData)^.RefCount);
+      If PLSOSharedData(fSharedData)^.RefCount <= 1 then
+        raise ELSOOpenError.Create('TLinSyncObject.Initialize: Cannot open uninitialized object.');
+    finally
+      fNamedSharedItem.GlobalUnlock;
+    end;
+    ResolveLockPtr;
+  end
+else raise ELSOOpenError.Create('TLinSyncObject.Initialize: Cannot open unnamed object.');
 end;
 
 //------------------------------------------------------------------------------
@@ -451,32 +545,36 @@ If Assigned(fSharedData) then
   end;
 end;
 
+//------------------------------------------------------------------------------
+
+constructor TLinSyncObject.ProtectedCreate(const Name: String; InitializingData: PtrUInt);
+begin
+inherited Create;
+Initialize(Name,InitializingData);
+end;
+
 {-------------------------------------------------------------------------------
     TLinSyncObject - public methods
 -------------------------------------------------------------------------------}
 
 constructor TLinSyncObject.Create(const Name: String);
 begin
-inherited Create;
-Initialize(Name);
+ProtectedCreate(Name,0);
 end;
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 constructor TLinSyncObject.Create;
 begin
-Create('');
+ProtectedCreate('',0);
 end;
 
 //------------------------------------------------------------------------------
 
-constructor TLinSyncObject.Open(const Name: String{$IFNDEF FPC}; Dummy: Integer = 0{$ENDIF});
+constructor TLinSyncObject.Open(const Name: String);
 begin
 inherited Create;
-If Length(Name) > 0 then
-  Initialize(Name)
-else
-  raise ELSOOpenError.Create('TLinSyncObject.Open: Cannot open unnamed object.');
+Initialize(Name);
 end;
 
 //------------------------------------------------------------------------------
@@ -501,11 +599,13 @@ If SourceObject is Self.ClassType then
             fSharedData := SourceObject.fSharedData;
             ResolveLockPtr; // normally called from Initialize
           end
-        else raise ELSInvalidObject.Create('TLinSyncObject.DuplicateFrom: Source object is in an inconsistent state.');
+        else raise ELSOInvalidObject.Create('TLinSyncObject.DuplicateFrom: ' +
+               'Source object is in an inconsistent state.');
       end
-    else Initialize(SourceObject.Name);
+    else Initialize(SourceObject.Name); // corresponds to open constructor
   end
-else raise ELSInvalidObject.CreateFmt('TLinSyncObject.DuplicateFrom: Incompatible source object (%s).',[SourceObject.ClassName]);
+else raise ELSOInvalidObject.CreateFmt('TLinSyncObject.DuplicateFrom: ' +
+       'Incompatible source object (%s).',[SourceObject.ClassName]);
 end;
 
 //------------------------------------------------------------------------------
@@ -546,92 +646,96 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TMutex.InitializeLock;
+{$IFDEF FPCDWM}{$PUSH}W5024{$ENDIF}
+procedure TMutex.InitializeLock(InitializingData: PtrUInt);
 var
   MutexAttr:  pthread_mutexattr_t;
 begin
-If CheckErr(pthread_mutexattr_init(@MutexAttr)) then
+If CheckResErr(pthread_mutexattr_init(@MutexAttr)) then
   try
-    If not CheckErr(pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE)) then
-      raise ELSOSysOpError.CreateFmt('TMutex.InitializeLock: Failed to set mutex attribute TYPE (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+    If not CheckResErr(pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE)) then
+      raise ELSOSysOpError.CreateFmt('TMutex.InitializeLock: ' +
+        'Failed to set mutex attribute TYPE (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
     If fProcessShared then
-      If not CheckErr(pthread_mutexattr_setpshared(@MutexAttr,PTHREAD_PROCESS_SHARED)) then
-        raise ELSOSysOpError.CreateFmt('TMutex.InitializeLock: Failed to set mutex attribute PSHARED (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
-    If not CheckErr(pthread_mutex_init(Addr(PLSOSharedData(fSharedData)^.Mutex),@MutexAttr)) then
-      raise ELSOSysInitError.CreateFmt('TMutex.InitializeLock: Failed to initialize mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+      If not CheckResErr(pthread_mutexattr_setpshared(@MutexAttr,PTHREAD_PROCESS_SHARED)) then
+        raise ELSOSysOpError.CreateFmt('TMutex.InitializeLock: ' +
+          'Failed to set mutex attribute PSHARED (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+    If not CheckResErr(pthread_mutex_init(Addr(PLSOSharedData(fSharedData)^.Mutex),@MutexAttr)) then
+      raise ELSOSysInitError.CreateFmt('TMutex.InitializeLock: ' +
+        'Failed to initialize mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
   finally
-    If not CheckErr(pthread_mutexattr_destroy(@MutexAttr)) then
-      raise ELSOSysFinalError.CreateFmt('TMutex.InitializeLock: Failed to destroy mutex attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+    If not CheckResErr(pthread_mutexattr_destroy(@MutexAttr)) then
+      raise ELSOSysFinalError.CreateFmt('TMutex.InitializeLock: ' +
+        'Failed to destroy mutex attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
   end
-else raise ELSOSysInitError.CreateFmt('TMutex.InitializeLock: Failed to initialize mutex attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+else raise ELSOSysInitError.CreateFmt('TMutex.InitializeLock: ' +
+       'Failed to initialize mutex attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
 
 //------------------------------------------------------------------------------
 
 procedure TMutex.FinalizeLock;
 begin
-If not CheckErr(pthread_mutex_destroy(fLockPtr)) then
-  raise ELSOSysFinalError.CreateFmt('TMutex.FinalizeLock: Failed to destroy mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+If not CheckResErr(pthread_mutex_destroy(Addr(PLSOSharedData(fSharedData)^.Mutex))) then
+  raise ELSOSysFinalError.CreateFmt('TMutex.FinalizeLock: ' +
+    'Failed to destroy mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
 
 {-------------------------------------------------------------------------------
     TMutex - public methods
 -------------------------------------------------------------------------------}
 
-Function TMutex.TimedLockMutex(Timeout: UInt32): TLSOWaitResult;
-var
-  TimeoutSpec:  timespec;
-  LockResult:   cInt;
-begin
-ResolveTimeout(Timeout,TimeoutSpec);
-LockResult := pthread_mutex_timedlock(fLockPtr,@TimeoutSpec);
-fLastError:= Integer(LockResult);
-case LockResult of
-  0:              Result := wrSignaled;
-  ESysETIMEDOUT:  Result := wrTimeout;
-else
-  Result := wrError;
-end;
-end;
-
-//------------------------------------------------------------------------------
-
 procedure TMutex.LockMutex;
 begin
-If not CheckErr(pthread_mutex_lock(fLockPtr)) then
-  raise ELSOSysOpError.CreateFmt('TMutex.LockMutex: Failed to lock mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+If not CheckResErr(pthread_mutex_lock(fLockPtr)) then
+  raise ELSOSysOpError.CreateFmt('TMutex.LockMutex: ' +
+    'Failed to lock mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
 
 //------------------------------------------------------------------------------
 
 Function TMutex.TryLockMutex: Boolean;
-var
-  LockResult: cInt;
 begin
-LockResult := pthread_mutex_trylock(fLockPtr);
-If LockResult <> 0 then
+Result := CheckResErr(pthread_mutex_trylock(fLockPtr));
+If not Result and (ThrErrorCode <> ESysEBUSY) then
+  raise ELSOSysOpError.CreateFmt('TMutex.TryLockMutex: ' +
+    'Failed to try-lock mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TMutex.TimedLockMutex(Timeout: UInt32): TLSOWaitResult;
+var
+  TimeoutSpec:  timespec;
+begin
+ResolveTimeout(Timeout,TimeoutSpec);
+If not CheckResErr(pthread_mutex_timedlock(fLockPtr,@TimeoutSpec)) then
   begin
-    Result := False;
-    fLastError := Integer(LockResult);
-    If LockResult <> ESysEBUSY then
-      raise ELSOSysOpError.CreateFmt('TMutex.TryLockMutex: Failed to try-lock mutex (%d - %s).',[LockResult,StrError(LockResult)]);
+    If ThrErrorCode <> ESysETIMEDOUT then
+      begin
+        Result := wrError;
+        fLastError := Integer(ThrErrorCode);
+      end
+    else Result := wrTimeout;
   end
-else Result := True;
+else Result := wrSignaled;
 end;
 
 //------------------------------------------------------------------------------
 
 procedure TMutex.UnlockMutex;
 begin
-If not CheckErr(pthread_mutex_unlock(fLockPtr)) then
-  raise ELSOSysOpError.CreateFmt('TMutex.UnlockMutex: Failed to unlock mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+If not CheckResErr(pthread_mutex_unlock(fLockPtr)) then
+  raise ELSOSysOpError.CreateFmt('TMutex.UnlockMutex: ' +
+    'Failed to unlock mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
 
 //------------------------------------------------------------------------------
 
 Function TMutex.LockMutexSilent: Boolean;
 begin
-Result := CheckErr(pthread_mutex_lock(fLockPtr));
+Result := CheckResErr(pthread_mutex_lock(fLockPtr));
 fLastError := Integer(ThrErrorCode);
 end;
 
@@ -639,15 +743,198 @@ end;
 
 Function TMutex.TryLockMutexSilent: Boolean;
 begin
-Result := CheckErr(pthread_mutex_trylock(fLockPtr));
-fLastError := Integer(ThrErrorCode);
+Result := CheckResErr(pthread_mutex_trylock(fLockPtr));
+If not Result and (ThrErrorCode = ESysEBUSY) then
+  fLastError := 0
+else
+  fLastError := Integer(ThrErrorCode);
 end;
 
 //------------------------------------------------------------------------------
 
 Function TMutex.UnlockMutexSilent: Boolean;
 begin
-Result := CheckErr(pthread_mutex_unlock(fLockPtr));
+Result := CheckResErr(pthread_mutex_unlock(fLockPtr));
+fLastError := Integer(ThrErrorCode);
+end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                   TSemaphore
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TSemaphore - class implementation
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TSemaphore - protected methods
+-------------------------------------------------------------------------------}
+
+class Function TSemaphore.GetLockType: TLSOLockType;
+begin
+Result := ltSemaphore;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSemaphore.ResolveLockPtr;
+begin
+fLockPtr := Addr(PLSOSharedData(fSharedData)^.Semaphore);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSemaphore.InitializeLock(InitializingData: PtrUInt);
+begin
+If not CheckErrAlt(sem_init(Addr(PLSOSharedData(fSharedData)^.Semaphore),Ord(fProcessShared),cUnsigned(InitializingData))) then
+  raise ELSOSysInitError.CreateFmt('TSemaphore.InitializeLock: ' +
+    'Failed to initialize semaphore (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSemaphore.FinalizeLock;
+begin
+If not CheckErrAlt(sem_destroy(Addr(PLSOSharedData(fSharedData)^.Semaphore))) then
+  raise ELSOSysFinalError.CreateFmt('TSemaphore.FinalizeLock: ' +
+    'Failed to destroy semaphore (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+{-------------------------------------------------------------------------------
+    TSemaphore - public methods
+-------------------------------------------------------------------------------}
+
+constructor TSemaphore.Create(const Name: String; InitialValue: cUnsigned);
+begin
+ProtectedCreate(Name,PtrUInt(InitialValue));
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TSemaphore.Create(InitialValue: cUnsigned);
+begin
+ProtectedCreate('',PtrUInt(InitialValue))
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TSemaphore.Create(const Name: String);
+begin
+ProtectedCreate(Name,0);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TSemaphore.Create;
+begin
+ProtectedCreate('',0);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSemaphore.WaitSemaphore;
+var
+  ExitWait: Boolean;
+begin
+repeat
+  ExitWait := True;
+  If not CheckErrAlt(sem_wait(fLockPtr)) then
+    begin
+      If ThrErrorCode = ESysEINTR then
+        ExitWait := False
+      else
+        raise ELSOSysOpError.CreateFmt('TSemaphore.WaitSemaphore: ' +
+          'Failed to wait on semaphore (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+    end;
+until ExitWait;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSemaphore.TryWaitSemaphore: Boolean;
+var
+  ExitWait: Boolean;
+begin
+repeat
+  ExitWait := True;
+  Result := CheckErrAlt(sem_trywait(fLockPtr));
+  If not Result then
+    case ThrErrorCode of
+      ESysEINTR:  ExitWait := False;
+      ESysEAGAIN:;// do nothing (exit with result being false)
+    else
+      raise ELSOSysOpError.CreateFmt('TSemaphore.TryWaitSemaphore: ' +
+        'Failed to try-wait on semaphore (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+    end;
+until ExitWait;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSemaphore.TimedWaitSemaphore(Timeout: UInt32): TLSOWaitResult;
+var
+  TimeoutSpec:  timespec;
+  ExitWait:     Boolean;
+begin
+ResolveTimeout(Timeout,TimeoutSpec);
+repeat
+  ExitWait := True;
+  If not CheckErrAlt(sem_timedwait(fLockPtr,@TimeoutSpec)) then
+    case ThrErrorCode of
+      ESysEINTR:      ExitWait := False;  // no need to reset timeout, it is absolute
+      ESysETIMEDOUT:  Result := wrTimeout;
+    else
+      Result := wrError;
+      fLastError := ThrErrorCode;
+    end
+  else Result := wrSignaled;
+until ExitWait;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSemaphore.PostSemaphore;
+begin
+If not CheckErrAlt(sem_post(fLockPtr)) then
+  raise ELSOSysOpError.CreateFmt('TSemaphore.PostSemaphore: ' +
+    'Failed to post semaphore (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSemaphore.WaitSemaphoreSilent: Boolean;
+var
+  ExitWait: Boolean;
+begin
+repeat
+  Result := CheckErrAlt(sem_wait(fLockPtr));
+  ExitWait := Result or (ThrErrorCode <> ESysEINTR);
+until ExitWait;
+fLastError := Integer(ThrErrorCode);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSemaphore.TryWaitSemaphoreSilent: Boolean;
+var
+  ExitWait: Boolean;
+begin
+repeat
+  Result := CheckErrAlt(sem_trywait(fLockPtr));
+  ExitWait := Result or (ThrErrorCode <> ESysEINTR);
+until ExitWait;
+If not Result and (ThrErrorCode = ESysEAGAIN) then
+  fLastError := 0
+else
+  fLastError := Integer(ThrErrorCode);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSemaphore.PostSemaphoreSilent: Boolean;
+begin
+Result := CheckErrAlt(sem_post(fLockPtr));
 fLastError := Integer(ThrErrorCode);
 end;
 
