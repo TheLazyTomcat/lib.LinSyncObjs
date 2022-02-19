@@ -17,7 +17,7 @@ unit LinSyncObjs;
 interface
 
 uses
-  SysUtils, BaseUnix,
+  SysUtils, BaseUnix, PThreads,
   AuxTypes, AuxClasses, NamedSharedItems;
 
 {$IFDEF FPC_DisableWarns}
@@ -79,6 +79,9 @@ type
                                  TLinSyncObject
 --------------------------------------------------------------------------------
 ===============================================================================}
+const
+  INFINITE = UInt32($FFFFFFFF); // infinite timeout
+
 type
   TLSOSharedUserData = packed array[0..31] of Byte;
   PLSOSharedUserData = ^TLSOSharedUserData;
@@ -87,7 +90,7 @@ type
   TLSOWaitResult = (wrSignaled,wrTimeout,wrError);
 
   TLSOLockType = (ltInvalid,ltSpinLock,ltEvent,ltMutex,ltSemaphore,ltRWLock,
-                  ltCondVar,ltBarrier,ltSimpleEvent,ltAdvancedEVent);
+                  ltCondVar,ltCondVarEx,ltBarrier,ltSimpleEvent,ltAdvancedEVent);
 
 {===============================================================================
     TLinSyncObject - class declaration
@@ -268,6 +271,94 @@ type
 
 {===============================================================================
 --------------------------------------------------------------------------------
+                               TConditionVariable
+--------------------------------------------------------------------------------
+===============================================================================}
+type
+  // types for autocycle
+  TLSOWakeOption = (woWakeOne,woWakeAll,woWakeBeforeUnlock);
+  TLSOWakeOptions = set of TLSOWakeOption;
+
+  TLSOPredicateCheckEvent = procedure(Sender: TObject; var Predicate: Boolean) of object;
+  TLSOPredicateCheckCallback = procedure(Sender: TObject; var Predicate: Boolean);
+
+  TLSODataAccessEvent = procedure(Sender: TObject; var WakeOptions: TLSOWakeOptions) of object;
+  TLSODataAccessCallback = procedure(Sender: TObject; var WakeOptions: TLSOWakeOptions);
+
+{===============================================================================
+    TConditionVariable - class declaration
+===============================================================================}
+type
+  TConditionVariable = class(TWrapperLinSyncObject)
+  protected
+    // autocycle events
+    fOnPredicateCheckEvent:     TLSOPredicateCheckEvent;
+    fOnPredicateCheckCallback:  TLSOPredicateCheckCallback;
+    fOnDataAccessEvent:         TLSODataAccessEvent;
+    fOnDataAccessCallback:      TLSODataAccessCallback;
+    // autocycle methods
+    Function DoOnPredicateCheck: Boolean; virtual;
+    Function DoOnDataAccess: TLSOWakeOptions; virtual;
+    procedure SelectWake(WakeOptions: TLSOWakeOptions); virtual;
+    // inherited methods
+    class Function GetLockType: TLSOLockType; override;
+    procedure ResolveLockPtr; override;
+    procedure InitializeLock(InitializingData: PtrUInt); override;
+    procedure FinalizeLock; override;
+  public
+    procedure WaitStrict(DataLock: ppthread_mutex_t); overload; virtual;
+    procedure WaitStrict(DataLock: TMutex); overload; virtual;
+    Function Wait(DataLock: ppthread_mutex_t): Boolean; overload; virtual;
+    Function Wait(DataLock: TMutex): Boolean; overload; virtual;
+    Function TimedWait(DataLock: ppthread_mutex_t; Timeout: UInt32): TLSOWaitResult; overload; virtual;
+    Function TimedWait(DataLock: TMutex; Timeout: UInt32): TLSOWaitResult; overload; virtual;
+    procedure SignalStrict; virtual;
+    Function Signal: Boolean; virtual;
+    procedure BroadcastStrict; virtual;
+    Function Broadcast: Boolean; virtual;
+    procedure AutoCycle(DataLock: ppthread_mutex_t; Timeout: UInt32); overload; virtual;
+    procedure AutoCycle(DataLock: TMutex; Timeout: UInt32); overload; virtual;
+    procedure AutoCycle(DataLock: ppthread_mutex_t); overload; virtual;
+    procedure AutoCycle(DataLock: TMutex); overload; virtual;
+    // events
+    property OnPredicateCheckEvent: TLSOPredicateCheckEvent read fOnPredicateCheckEvent write fOnPredicateCheckEvent;
+    property OnPredicateCheckCallback: TLSOPredicateCheckCallback read fOnPredicateCheckCallback write fOnPredicateCheckCallback;
+    property OnPredicateCheck: TLSOPredicateCheckEvent read fOnPredicateCheckEvent write fOnPredicateCheckEvent;
+    property OnDataAccessEvent: TLSODataAccessEvent read fOnDataAccessEvent write fOnDataAccessEvent;
+    property OnDataAccessCallback: TLSODataAccessCallback read fOnDataAccessCallback write fOnDataAccessCallback;
+    property OnDataAccess: TLSODataAccessEvent read fOnDataAccessEvent write fOnDataAccessEvent;
+  end;
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                              TConditionVariableEx
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TConditionVariableEx - class declaration
+===============================================================================}
+type
+  TConditionVariableEx = class(TConditionVariable)
+  protected
+    fDataLockPtr: Pointer;
+    class Function GetLockType: TLSOLockType; override;
+    procedure ResolveLockPtr; override;
+    procedure InitializeLock(InitializingData: PtrUInt); override;
+    procedure FinalizeLock; override;
+  public
+    procedure LockStrict; virtual;
+    Function Lock: Boolean; virtual;
+    procedure UnlockStrict; virtual;
+    Function Unlock: Boolean; virtual;
+    procedure WaitStrict; overload; virtual;
+    Function Wait: Boolean; overload; virtual;
+    Function TimedWait(Timeout: UInt32): TLSOWaitResult; overload; virtual;
+    procedure AutoCycle(Timeout: UInt32); overload; virtual;
+    procedure AutoCycle; overload; virtual;
+  end;
+
+{===============================================================================
+--------------------------------------------------------------------------------
                                Utility functions
 --------------------------------------------------------------------------------
 ===============================================================================}
@@ -280,7 +371,7 @@ Function WaitResultToStr(WaitResult: TLSOWaitResult): String;
 implementation
 
 uses
-  UnixType, Linux, pThreads, Errors,
+  UnixType, Linux, Errors,
   InterlockedOps;
 
 {$IFDEF FPC_DisableWarns}
@@ -425,17 +516,20 @@ const
 type
   TLSOSimpleEvent = record
   end;
-  PLSOSimpleEvent = {%H-}^TLSOSimpleEvent;
 
 type
   TLSOEvent = record
   end;
-  PLSOEvent = {%H-}^TLSOEvent;
 
 type
   TLSOAdvancedEvent = record
   end;
-  PLSOAdvancedEvent = {%H-}^TLSOAdvancedEvent;
+
+type
+  TLSOConditionVariableEx = record
+    DataLock: pthread_mutex_t;
+    CondVar:  pthread_cond_t;
+  end;
 
 type
   TLSOSharedData = record
@@ -450,6 +544,7 @@ type
       ltSemaphore:      (Semaphore:     sem_t);
       ltRWLock:         (RWLock:        pthread_rwlock_t);
       ltCondVar:        (CondVar:       pthread_cond_t);
+      ltCondVarEx:      (CondVarEx:     TLSOConditionVariableEx);
       ltBarrier:        (Barrier:       pthread_barrier_t);
   end;
   PLSOSharedData = ^TLSOSharedData;
@@ -504,7 +599,7 @@ If PLSOSharedData(fSharedData)^.LockType <> ltInvalid then
   begin
     If PLSOSharedData(fSharedData)^.LockType <> GetLockType then
       raise ELSOInvalidLockType.CreateFmt('TLinSyncObject.CheckAndSetLockType: ' +
-        'Existing lock is of incompatible type (%d)',[Ord(PLSOSharedData(fSharedData)^.LockType)]);
+        'Existing lock is of incompatible type (%d).',[Ord(PLSOSharedData(fSharedData)^.LockType)]);
   end
 else PLSOSharedData(fSharedData)^.LockType := GetLockType;
 end;
@@ -891,17 +986,27 @@ Function TMutex.TimedLock(Timeout: UInt32): TLSOWaitResult;
 var
   TimeoutSpec:  timespec;
 begin
-ResolveTimeout(Timeout,TimeoutSpec);
-If not CheckResErr(pthread_mutex_timedlock(fLockPtr,@TimeoutSpec)) then
+If Timeout <> INFINITE then
   begin
-    If ThrErrorCode <> ESysETIMEDOUT then
+    ResolveTimeout(Timeout,TimeoutSpec);
+    If not CheckResErr(pthread_mutex_timedlock(fLockPtr,@TimeoutSpec)) then
       begin
-        Result := wrError;
-        fLastError := Integer(ThrErrorCode);
+        If ThrErrorCode <> ESysETIMEDOUT then
+          begin
+            Result := wrError;
+            fLastError := Integer(ThrErrorCode);
+          end
+        else Result := wrTimeout;
       end
-    else Result := wrTimeout;
+    else Result := wrSignaled;
   end
-else Result := wrSignaled;
+else
+  begin
+    If Lock then
+      Result := wrSignaled
+    else
+      Result := wrError;
+  end;
 end;
 
 //------------------------------------------------------------------------------
@@ -1089,19 +1194,29 @@ var
   TimeoutSpec:  timespec;
   ExitWait:     Boolean;
 begin
-ResolveTimeout(Timeout,TimeoutSpec);
-repeat
-  ExitWait := True;
-  If not CheckErrAlt(sem_timedwait(fLockPtr,@TimeoutSpec)) then
-    case ThrErrorCode of
-      ESysEINTR:      ExitWait := False;  // no need to reset timeout, it is absolute
-      ESysETIMEDOUT:  Result := wrTimeout;
+If Timeout <> INFINITE then
+  begin
+    ResolveTimeout(Timeout,TimeoutSpec);
+    repeat
+      ExitWait := True;
+      If not CheckErrAlt(sem_timedwait(fLockPtr,@TimeoutSpec)) then
+        case ThrErrorCode of
+          ESysEINTR:      ExitWait := False;  // no need to reset timeout, it is absolute
+          ESysETIMEDOUT:  Result := wrTimeout;
+        else
+          Result := wrError;
+          fLastError := ThrErrorCode;
+        end
+      else Result := wrSignaled;
+    until ExitWait;
+  end
+else
+  begin
+    If Wait then
+      Result := wrSignaled
     else
       Result := wrError;
-      fLastError := ThrErrorCode;
-    end
-  else Result := wrSignaled;
-until ExitWait;
+  end;
 end;
 
 //------------------------------------------------------------------------------
@@ -1157,17 +1272,17 @@ If CheckResErr(pthread_rwlockattr_init(@RWLockAttr)) then
   try
     If fProcessShared then
       If not CheckResErr(pthread_rwlockattr_setpshared(@RWLockAttr,PTHREAD_PROCESS_SHARED)) then
-        raise ELSOSysOpError.CreateFmt('TRWLock.InitializeLock: ' +
+        raise ELSOSysOpError.CreateFmt('TReadWriteLock.InitializeLock: ' +
           'Failed to set rwlock attribute PSHARED (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
     If not CheckResErr(pthread_rwlock_init(Addr(PLSOSharedData(fSharedData)^.RWLock),@RWLockAttr)) then
-      raise ELSOSysInitError.CreateFmt('TRWLock.InitializeLock: ' +
+      raise ELSOSysInitError.CreateFmt('TReadWriteLock.InitializeLock: ' +
         'Failed to initialize rwlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
   finally
     If not CheckResErr(pthread_rwlockattr_destroy(@RWLockAttr)) then
-      raise ELSOSysFinalError.CreateFmt('TRWLock.InitializeLock: ' +
+      raise ELSOSysFinalError.CreateFmt('TReadWriteLock.InitializeLock: ' +
         'Failed to destroy rwlock attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
   end
-else raise ELSOSysInitError.CreateFmt('TRWLock.InitializeLock: ' +
+else raise ELSOSysInitError.CreateFmt('TReadWriteLock.InitializeLock: ' +
        'Failed to initialize rwlock attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
 {$IFDEF FPCDWM}{$POP}{$ENDIF}
@@ -1177,18 +1292,18 @@ end;
 procedure TReadWriteLock.FinalizeLock;
 begin
 If not CheckResErr(pthread_rwlock_destroy(Addr(PLSOSharedData(fSharedData)^.RWLock))) then
-  raise ELSOSysFinalError.CreateFmt('TRWLock.FinalizeLock: ' +
+  raise ELSOSysFinalError.CreateFmt('TReadWriteLock.FinalizeLock: ' +
     'Failed to destroy rwlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
 
 {-------------------------------------------------------------------------------
-    TRWLock - public methods
+    TReadWriteLock - public methods
 -------------------------------------------------------------------------------}
 
 procedure TReadWriteLock.ReadLockStrict;
 begin
 If not CheckResErr(pthread_rwlock_rdlock(fLockPtr)) then
-  raise ELSOSysOpError.CreateFmt('TRWLock.ReadLockStrict: ' +
+  raise ELSOSysOpError.CreateFmt('TReadWriteLock.ReadLockStrict: ' +
     'Failed to read-lock rwlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
 
@@ -1206,7 +1321,7 @@ Function TReadWriteLock.TryReadLockStrict: Boolean;
 begin
 Result := CheckResErr(pthread_rwlock_tryrdlock(fLockPtr));
 If not Result and (ThrErrorCode <> ESysEBUSY) then
-  raise ELSOSysOpError.CreateFmt('TRWLock.TryReadLockStrict: ' +
+  raise ELSOSysOpError.CreateFmt('TReadWriteLock.TryReadLockStrict: ' +
     'Failed to try-read-lock rwlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
 
@@ -1227,25 +1342,34 @@ Function TReadWriteLock.TimedReadLock(Timeout: UInt32): TLSOWaitResult;
 var
   TimeoutSpec:  timespec;
 begin
-ResolveTimeout(Timeout,TimeoutSpec);
-If not CheckResErr(pthread_rwlock_timedrdlock(fLockPtr,@TimeoutSpec)) then
+If Timeout <> INFINITE then
   begin
-    If ThrErrorCode <> ESysETIMEDOUT then
+    ResolveTimeout(Timeout,TimeoutSpec);
+    If not CheckResErr(pthread_rwlock_timedrdlock(fLockPtr,@TimeoutSpec)) then
       begin
-        Result := wrError;
-        fLastError := Integer(ThrErrorCode);
+        If ThrErrorCode <> ESysETIMEDOUT then
+          begin
+            Result := wrError;
+            fLastError := Integer(ThrErrorCode);
+          end
+        else Result := wrTimeout;
       end
-    else Result := wrTimeout;
+    else Result := wrSignaled;
   end
-else Result := wrSignaled;
+else
+  begin
+    If ReadLock then
+      Result := wrSignaled
+    else
+      Result := wrError;
+  end;
 end;
-
 //------------------------------------------------------------------------------
 
 procedure TReadWriteLock.WriteLockStrict;
 begin
 If not CheckResErr(pthread_rwlock_wrlock(fLockPtr)) then
-  raise ELSOSysOpError.CreateFmt('TRWLock.WriteLockStrict: ' +
+  raise ELSOSysOpError.CreateFmt('TReadWriteLock.WriteLockStrict: ' +
     'Failed to write-lock rwlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
 
@@ -1263,7 +1387,7 @@ Function TReadWriteLock.TryWriteLockStrict: Boolean;
 begin
 Result := CheckResErr(pthread_rwlock_trywrlock(fLockPtr));
 If not Result and (ThrErrorCode <> ESysEBUSY) then
-  raise ELSOSysOpError.CreateFmt('TRWLock.TryWriteLockStrict: ' +
+  raise ELSOSysOpError.CreateFmt('TReadWriteLock.TryWriteLockStrict: ' +
     'Failed to try-write-lock rwlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
 
@@ -1284,17 +1408,27 @@ Function TReadWriteLock.TimedWriteLock(Timeout: UInt32): TLSOWaitResult;
 var
   TimeoutSpec:  timespec;
 begin
-ResolveTimeout(Timeout,TimeoutSpec);
-If not CheckResErr(pthread_rwlock_timedwrlock(fLockPtr,@TimeoutSpec)) then
+If Timeout <> INFINITE then
   begin
-    If ThrErrorCode <> ESysETIMEDOUT then
+    ResolveTimeout(Timeout,TimeoutSpec);
+    If not CheckResErr(pthread_rwlock_timedwrlock(fLockPtr,@TimeoutSpec)) then
       begin
-        Result := wrError;
-        fLastError := Integer(ThrErrorCode);
+        If ThrErrorCode <> ESysETIMEDOUT then
+          begin
+            Result := wrError;
+            fLastError := Integer(ThrErrorCode);
+          end
+        else Result := wrTimeout;
       end
-    else Result := wrTimeout;
+    else Result := wrSignaled;
   end
-else Result := wrSignaled;
+else
+  begin
+    If WriteLock then
+      Result := wrSignaled
+    else
+      Result := wrError;
+  end;
 end;
 
 //------------------------------------------------------------------------------
@@ -1302,7 +1436,7 @@ end;
 procedure TReadWriteLock.UnlockStrict;
 begin
 If not CheckResErr(pthread_rwlock_unlock(fLockPtr)) then
-  raise ELSOSysOpError.CreateFmt('TRWLock.UnlockStrict: ' +
+  raise ELSOSysOpError.CreateFmt('TReadWriteLock.UnlockStrict: ' +
     'Failed to unlock rwlock (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
 
@@ -1312,6 +1446,428 @@ Function TReadWriteLock.Unlock: Boolean;
 begin
 Result := CheckResErr(pthread_rwlock_unlock(fLockPtr));
 fLastError := Integer(ThrErrorCode);
+end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                               TConditionVariable
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TConditionVariable - class implementation
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TConditionVariable - protected methods
+-------------------------------------------------------------------------------}
+
+Function TConditionVariable.DoOnPredicateCheck: Boolean;
+begin
+Result := False;
+If Assigned(fOnPredicateCheckEvent) then
+  fOnPredicateCheckEvent(Self,Result);
+If Assigned(fOnPredicateCheckCallback) then
+  fOnPredicateCheckCallback(Self,Result);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TConditionVariable.DoOnDataAccess: TLSOWakeOptions;
+begin
+If Assigned(fOnDataAccessEvent) or Assigned(fOnDataAccessCallback) then
+  begin
+    Result := [];
+    If Assigned(fOnDataAccessEvent) then
+      fOnDataAccessEvent(Self,Result);
+    If Assigned(fOnDataAccessCallback) then
+      fOnDataAccessCallback(Self,Result);
+  end
+else Result := [woWakeAll];
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TConditionVariable.SelectWake(WakeOptions: TLSOWakeOptions);
+begin
+If ([woWakeOne,woWakeAll] *{intersection} WakeOptions) <> [] then
+  begin
+    If woWakeAll in WakeOptions then
+      Broadcast
+    else
+      Signal;
+  end;
+end;
+
+//------------------------------------------------------------------------------
+
+class Function TConditionVariable.GetLockType: TLSOLockType;
+begin
+Result := ltCondVar;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TConditionVariable.ResolveLockPtr;
+begin
+fLockPtr := Addr(PLSOSharedData(fSharedData)^.CondVar);
+end;
+
+//------------------------------------------------------------------------------
+
+{$IFDEF FPCDWM}{$PUSH}W5024{$ENDIF}
+procedure TConditionVariable.InitializeLock(InitializingData: PtrUInt);
+var
+  CondVarAttr:  pthread_condattr_t;
+begin
+If CheckResErr(pthread_condattr_init(@CondVarAttr)) then
+  try
+    If fProcessShared then
+      If not CheckResErr(pthread_condattr_setpshared(@CondVarAttr,PTHREAD_PROCESS_SHARED)) then
+        raise ELSOSysOpError.CreateFmt('TConditionVariable.InitializeLock: ' +
+          'Failed to set condvar attribute PSHARED (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+    If not CheckResErr(pthread_cond_init(Addr(PLSOSharedData(fSharedData)^.CondVar),@CondVarAttr)) then
+      raise ELSOSysInitError.CreateFmt('TConditionVariable.InitializeLock: ' +
+        'Failed to initialize condvar (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+  finally
+    If not CheckResErr(pthread_condattr_destroy(@CondVarAttr)) then
+      raise ELSOSysFinalError.CreateFmt('TConditionVariable.InitializeLock: ' +
+        'Failed to destroy condvar attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+  end
+else raise ELSOSysInitError.CreateFmt('TConditionVariable.InitializeLock: ' +
+       'Failed to initialize condvar attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
+
+//------------------------------------------------------------------------------
+
+procedure TConditionVariable.FinalizeLock;
+begin
+If not CheckResErr(pthread_cond_destroy(Addr(PLSOSharedData(fSharedData)^.CondVar))) then
+  raise ELSOSysFinalError.CreateFmt('TConditionVariable.FinalizeLock: ' +
+    'Failed to destroy condvar (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+{-------------------------------------------------------------------------------
+    TConditionVariable - public methods
+-------------------------------------------------------------------------------}
+
+procedure TConditionVariable.WaitStrict(DataLock: ppthread_mutex_t);
+begin
+If not CheckResErr(pthread_cond_wait(fLockPtr,DataLock)) then
+  raise ELSOSysOpError.CreateFmt('TConditionVariable.WaitStrict: ' +
+    'Failed to wait on condvar (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+procedure TConditionVariable.WaitStrict(DataLock: TMutex);
+begin
+WaitStrict(DataLock.fLockPtr);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TConditionVariable.Wait(DataLock: ppthread_mutex_t): Boolean;
+begin
+Result := CheckResErr(pthread_cond_wait(fLockPtr,DataLock));
+fLastError := Integer(ThrErrorCode);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function TConditionVariable.Wait(DataLock: TMutex): Boolean;
+begin
+Result := Wait(DataLock.fLockPtr);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TConditionVariable.TimedWait(DataLock: ppthread_mutex_t; Timeout: UInt32): TLSOWaitResult;
+var
+  TimeoutSpec:  timespec;
+begin
+If Timeout <> INFINITE then
+  begin
+    ResolveTimeout(Timeout,TimeoutSpec);
+    If not CheckResErr(pthread_cond_timedwait(fLockPtr,DataLock,@TimeoutSpec)) then
+      begin
+        If ThrErrorCode <> ESysETIMEDOUT then
+          begin
+            Result := wrError;
+            fLastError := Integer(ThrErrorCode);
+          end
+        else Result := wrTimeout;
+      end
+    else Result := wrSignaled;
+  end
+else
+  begin
+    If Wait(DataLock) then
+      Result := wrSignaled
+    else
+      Result := wrError;
+  end;
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function TConditionVariable.TimedWait(DataLock: TMutex; Timeout: UInt32): TLSOWaitResult;
+begin
+Result := TimedWait(DataLock.fLockPtr,Timeout);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TConditionVariable.SignalStrict;
+begin
+If not CheckResErr(pthread_cond_signal(fLockPtr)) then
+  raise ELSOSysOpError.CreateFmt('TConditionVariable.SignalStrict: ' +
+    'Failed to signal condvar (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TConditionVariable.Signal: Boolean;
+begin
+Result := CheckResErr(pthread_cond_signal(fLockPtr));
+fLastError := Integer(ThrErrorCode);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TConditionVariable.BroadcastStrict;
+begin
+If not CheckResErr(pthread_cond_broadcast(fLockPtr)) then
+  raise ELSOSysOpError.CreateFmt('TConditionVariable.BroadcastStrict: ' +
+    'Failed to broadcast condvar (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TConditionVariable.Broadcast: Boolean;
+begin
+Result := CheckResErr(pthread_cond_broadcast(fLockPtr));
+fLastError := Integer(ThrErrorCode);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TConditionVariable.AutoCycle(DataLock: ppthread_mutex_t; Timeout: UInt32);
+var
+  WakeOptions:  TLSOWakeOptions;
+begin
+If Assigned(fOnPredicateCheckEvent) or Assigned(fOnPredicateCheckCallback) then
+  begin
+    // lock synchronizer
+    If not CheckResErr(pthread_mutex_lock(DataLock)) then
+      raise ELSOSysOpError.CreateFmt('TConditionVariable.AutoCycle: ' +
+        'Failed to lock data-lock mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+    // test predicate and wait condition
+    while not DoOnPredicateCheck do
+      TimedWait(DataLock,Timeout);
+    // access protected data
+    WakeOptions := DoOnDataAccess;
+    // wake waiters before unlock
+    If (woWakeBeforeUnlock in WakeOptions) then
+      SelectWake(WakeOptions);
+    // unlock synchronizer
+    If not CheckResErr(pthread_mutex_unlock(DataLock)) then
+      raise ELSOSysOpError.CreateFmt('TConditionVariable.AutoCycle: ' +
+        'Failed to unlock data-lock mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+    // wake waiters after unlock
+    If not(woWakeBeforeUnlock in WakeOptions) then
+      SelectWake(WakeOptions);
+  end;
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+procedure TConditionVariable.AutoCycle(DataLock: TMutex; Timeout: UInt32);
+var
+  WakeOptions:  TLSOWakeOptions;
+begin
+If Assigned(fOnPredicateCheckEvent) or Assigned(fOnPredicateCheckCallback) then
+  begin
+    DataLock.LockStrict;
+    while not DoOnPredicateCheck do
+      TimedWait(DataLock,Timeout);
+    WakeOptions := DoOnDataAccess;
+    If (woWakeBeforeUnlock in WakeOptions) then
+      SelectWake(WakeOptions);
+    DataLock.UnlockStrict;
+    If not(woWakeBeforeUnlock in WakeOptions) then
+      SelectWake(WakeOptions);
+  end;
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+procedure TConditionVariable.AutoCycle(DataLock: ppthread_mutex_t);
+begin
+AutoCycle(DataLock,INFINITE);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+procedure TConditionVariable.AutoCycle(DataLock: TMutex);
+begin
+AutoCycle(DataLock,INFINITE);
+end;
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                              TConditionVariableEx
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TConditionVariableEx - class implementation
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TConditionVariableEx - protected methods
+-------------------------------------------------------------------------------}
+
+class Function TConditionVariableEx.GetLockType: TLSOLockType;
+begin
+Result := ltCondVarEx;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TConditionVariableEx.ResolveLockPtr;
+begin
+fLockPtr := Addr(PLSOSharedData(fSharedData)^.CondVarEx.CondVar);
+fDataLockPtr := Addr(PLSOSharedData(fSharedData)^.CondVarEx.DataLock);
+end;
+
+//------------------------------------------------------------------------------
+
+{$IFDEF FPCDWM}{$PUSH}W5024{$ENDIF}
+procedure TConditionVariableEx.InitializeLock(InitializingData: PtrUInt);
+var
+  MutexAttr:    pthread_mutexattr_t;
+  CondVarAttr:  pthread_condattr_t;
+begin
+// data-lock mutex
+If CheckResErr(pthread_mutexattr_init(@MutexAttr)) then
+  try
+    If not CheckResErr(pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE)) then
+      raise ELSOSysOpError.CreateFmt('TConditionVariableEx.InitializeLock: ' +
+        'Failed to set data-lock mutex attribute TYPE (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+    If fProcessShared then
+      If not CheckResErr(pthread_mutexattr_setpshared(@MutexAttr,PTHREAD_PROCESS_SHARED)) then
+        raise ELSOSysOpError.CreateFmt('TConditionVariableEx.InitializeLock: ' +
+          'Failed to set data-lock mutex attribute PSHARED (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+    If not CheckResErr(pthread_mutex_init(Addr(PLSOSharedData(fSharedData)^.CondVarEx.DataLock),@MutexAttr)) then
+      raise ELSOSysInitError.CreateFmt('TConditionVariableEx.InitializeLock: ' +
+        'Failed to initialize data-lock mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+  finally
+    If not CheckResErr(pthread_mutexattr_destroy(@MutexAttr)) then
+      raise ELSOSysFinalError.CreateFmt('TConditionVariableEx.InitializeLock: ' +
+        'Failed to destroy data-lock mutex attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+  end
+else raise ELSOSysInitError.CreateFmt('TConditionVariableEx.InitializeLock: ' +
+       'Failed to initialize data-lock mutex attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+// condition variable
+If CheckResErr(pthread_condattr_init(@CondVarAttr)) then
+  try
+    If fProcessShared then
+      If not CheckResErr(pthread_condattr_setpshared(@CondVarAttr,PTHREAD_PROCESS_SHARED)) then
+        raise ELSOSysOpError.CreateFmt('TConditionVariableEx.InitializeLock: ' +
+          'Failed to set condvar attribute PSHARED (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+    If not CheckResErr(pthread_cond_init(Addr(PLSOSharedData(fSharedData)^.CondVarEx.CondVar),@CondVarAttr)) then
+      raise ELSOSysInitError.CreateFmt('TConditionVariableEx.InitializeLock: ' +
+        'Failed to initialize condvar (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+  finally
+    If not CheckResErr(pthread_condattr_destroy(@CondVarAttr)) then
+      raise ELSOSysFinalError.CreateFmt('TConditionVariableEx.InitializeLock: ' +
+        'Failed to destroy condvar attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+  end
+else raise ELSOSysInitError.CreateFmt('TConditionVariableEx.InitializeLock: ' +
+       'Failed to initialize condvar attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
+
+//------------------------------------------------------------------------------
+
+procedure TConditionVariableEx.FinalizeLock;
+begin
+If not CheckResErr(pthread_cond_destroy(Addr(PLSOSharedData(fSharedData)^.CondVarEx.CondVar))) then
+  raise ELSOSysFinalError.CreateFmt('TConditionVariableEx.FinalizeLock: ' +
+    'Failed to destroy condvar (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+If not CheckResErr(pthread_mutex_destroy(Addr(PLSOSharedData(fSharedData)^.CondVarEx.DataLock))) then
+  raise ELSOSysFinalError.CreateFmt('TConditionVariableEx.FinalizeLock: ' +
+    'Failed to destroy data-lock mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+{-------------------------------------------------------------------------------
+    TConditionVariableEx - public methods
+-------------------------------------------------------------------------------}
+
+procedure TConditionVariableEx.LockStrict;
+begin
+If not CheckResErr(pthread_mutex_lock(fDataLockPtr)) then
+  raise ELSOSysOpError.CreateFmt('TConditionVariableEx.LockStrict: ' +
+    'Failed to lock data-lock mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TConditionVariableEx.Lock: Boolean;
+begin
+Result := CheckResErr(pthread_mutex_lock(fDataLockPtr));
+fLastError := Integer(ThrErrorCode);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TConditionVariableEx.UnlockStrict;
+begin
+If not CheckResErr(pthread_mutex_unlock(fDataLockPtr)) then
+  raise ELSOSysOpError.CreateFmt('TConditionVariableEx.UnlockStrict: ' +
+    'Failed to unlock data-lock mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TConditionVariableEx.Unlock: Boolean;
+begin
+Result := CheckResErr(pthread_mutex_unlock(fDataLockPtr));
+fLastError := Integer(ThrErrorCode);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TConditionVariableEx.WaitStrict;
+begin
+WaitStrict(fDataLockPtr);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TConditionVariableEx.Wait: Boolean;
+begin
+Result := Wait(fDataLockPtr);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TConditionVariableEx.TimedWait(Timeout: UInt32): TLSOWaitResult;
+begin
+Result := TimedWait(fDataLockPtr,Timeout);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TConditionVariableEx.AutoCycle(Timeout: UInt32);
+begin
+AutoCycle(fDataLockPtr,Timeout);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+procedure TConditionVariableEx.AutoCycle;
+begin
+AutoCycle(fDataLockPtr,INFINITE);
 end;
 
 
