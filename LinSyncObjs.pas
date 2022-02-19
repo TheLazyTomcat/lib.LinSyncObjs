@@ -89,8 +89,8 @@ type
 type
   TLSOWaitResult = (wrSignaled,wrTimeout,wrError);
 
-  TLSOLockType = (ltInvalid,ltSpinLock,ltEvent,ltMutex,ltSemaphore,ltRWLock,
-                  ltCondVar,ltCondVarEx,ltBarrier,ltSimpleEvent,ltAdvancedEVent);
+  TLSOLockType = (ltInvalid,ltSpinLock,ltSimpleEvent,ltEvent,ltAdvancedEVent,
+                  ltMutex,ltSemaphore,ltRWLock,ltCondVar,ltCondVarEx,ltBarrier);
 
 {===============================================================================
     TLinSyncObject - class declaration
@@ -359,6 +359,30 @@ type
 
 {===============================================================================
 --------------------------------------------------------------------------------
+                                    TBarrier
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TBarrier - class declaration
+===============================================================================}
+type
+  TBarrier = class(TWrapperLinSyncObject)
+  protected
+    class Function GetLockType: TLSOLockType; override;
+    procedure ResolveLockPtr; override;
+    procedure InitializeLock(InitializingData: PtrUInt); override;
+    procedure FinalizeLock; override;
+  public
+    constructor Create(const Name: String; Count: cUnsigned); overload; virtual;
+    constructor Create(Count: cUnsigned); overload; virtual;
+    constructor Create(const Name: String); override;
+    constructor Create; override;
+    procedure WaitStrict; virtual;
+    Function Wait: Boolean; virtual;
+  end;
+
+{===============================================================================
+--------------------------------------------------------------------------------
                                Utility functions
 --------------------------------------------------------------------------------
 ===============================================================================}
@@ -367,6 +391,8 @@ type
   Meant mainly for debugging.
 }
 Function WaitResultToStr(WaitResult: TLSOWaitResult): String;
+
+procedure Foo;
 
 implementation
 
@@ -379,10 +405,14 @@ uses
   {$DEFINE W5024:={$WARN 5024 OFF}} // Parameter "$1" not used
 {$ENDIF}
 
-//------------------------------------------------------------------------------
+{===============================================================================
+    Error checking and management
+===============================================================================}
 
 threadvar
   ThrErrorCode: cInt;
+
+//--  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
 
 Function CheckResErr(ReturnedValue: cInt): Boolean;
 begin
@@ -548,6 +578,11 @@ type
       ltBarrier:        (Barrier:       pthread_barrier_t);
   end;
   PLSOSharedData = ^TLSOSharedData;
+
+procedure Foo;
+begin
+writeln(sizeof(TLSOSharedData));
+end;
 
 //------------------------------------------------------------------------------
 
@@ -1868,6 +1903,117 @@ end;
 procedure TConditionVariableEx.AutoCycle;
 begin
 AutoCycle(fDataLockPtr,INFINITE);
+end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                    TBarrier
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TBarrier - class implementation
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TBarrier - protected methods
+-------------------------------------------------------------------------------}
+
+class Function TBarrier.GetLockType: TLSOLockType;
+begin
+Result := ltBarrier;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TBarrier.ResolveLockPtr;
+begin
+fLockPtr := Addr(PLSOSharedData(fSharedData)^.Barrier);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TBarrier.InitializeLock(InitializingData: PtrUInt);
+var
+  BarrierAttr:  pthread_barrierattr_t;
+begin
+If CheckResErr(pthread_barrierattr_init(@BarrierAttr)) then
+  try
+    If fProcessShared then
+      If not CheckResErr(pthread_barrierattr_setpshared(@BarrierAttr,PTHREAD_PROCESS_SHARED)) then
+        raise ELSOSysOpError.CreateFmt('TBarrier.InitializeLock: ' +
+          'Failed to set barrier attribute PSHARED (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+    If not CheckResErr(pthread_barrier_init(Addr(PLSOSharedData(fSharedData)^.Barrier),@BarrierAttr,cUnsigned(InitializingData))) then
+      raise ELSOSysInitError.CreateFmt('TBarrier.InitializeLock: ' +
+        'Failed to initialize barrier (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+  finally
+    If not CheckResErr(pthread_barrierattr_destroy(@BarrierAttr)) then
+      raise ELSOSysFinalError.CreateFmt('TBarrier.InitializeLock: ' +
+        'Failed to destroy barrier attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+  end
+else raise ELSOSysInitError.CreateFmt('TBarrier.InitializeLock: ' +
+       'Failed to initialize barrier attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TBarrier.FinalizeLock;
+begin
+If not CheckResErr(pthread_barrier_destroy(Addr(PLSOSharedData(fSharedData)^.Barrier))) then
+  raise ELSOSysFinalError.CreateFmt('TBarrier.FinalizeLock: ' +
+    'Failed to destroy barrier (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+{-------------------------------------------------------------------------------
+    TBarrier - public methods
+-------------------------------------------------------------------------------}
+
+constructor TBarrier.Create(const Name: String; Count: cUnsigned);
+begin
+ProtectedCreate(Name,PtrUInt(Count));
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TBarrier.Create(Count: cUnsigned);
+begin
+ProtectedCreate('',PtrUInt(Count));
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TBarrier.Create(const Name: String);
+begin
+ProtectedCreate(Name,1);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TBarrier.Create;
+begin
+ProtectedCreate('',1);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TBarrier.WaitStrict;
+begin
+If not CheckResErr(pthread_barrier_wait(fLockPtr)) then
+  If ThrErrorCode <> PTHREAD_BARRIER_SERIAL_THREAD then
+    raise ELSOSysOpError.CreateFmt('TBarrier.WaitStrict: ' +
+      'Failed to wait on barrier (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TBarrier.Wait: Boolean;
+begin
+Result := CheckResErr(pthread_barrier_wait(fLockPtr));
+If not Result and (ThrErrorCode = PTHREAD_BARRIER_SERIAL_THREAD) then
+  begin
+    Result := True;
+    fLastError := 0;
+  end
+else fLastError := Integer(ThrErrorCode);
 end;
 
 
