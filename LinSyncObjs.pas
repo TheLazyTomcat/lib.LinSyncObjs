@@ -91,8 +91,9 @@ type
 type
   TLSOWaitResult = (wrSignaled,wrTimeout,wrError);
 
-  TLSOLockType = (ltInvalid,ltSpinLock,ltSimpleEvent,ltEvent,ltAdvancedEVent,
-                  ltMutex,ltSemaphore,ltRWLock,ltCondVar,ltCondVarEx,ltBarrier);
+  TLSOLockType = (ltInvalid,ltSpinLock,ltSimpleManualEvent,ltSimpleAutoEvent,
+                  ltEvent,ltAdvancedEvent,ltMutex,ltSemaphore,ltRWLock,
+                  ltCondVar,ltCondVarEx,ltBarrier);
 
 {===============================================================================
     TLinSyncObject - class declaration
@@ -186,29 +187,72 @@ type
 
 {===============================================================================
 --------------------------------------------------------------------------------
-                                  TSimpleEvent
+                                TSimpleEventBase
 --------------------------------------------------------------------------------
 ===============================================================================}
 {===============================================================================
-    TSimpleEvent - class declaration
+    TSimpleEventBase - class declaration
 ===============================================================================}
 type
-  TSimpleEvent = class(TImplementorLinSyncObject)
+  TSimpleEventBase = class(TImplementorLinSyncObject)
   protected
-    class Function GetLockType: TLSOLockType; override;
-    procedure ResolveLockPtr; override;
-    procedure InitializeLock(InitializingData: PtrUInt); override;
     procedure FinalizeLock; override;
   public
     procedure LockStrict; virtual;
     Function Lock: Boolean; virtual;
     procedure UnlockStrict; virtual;
     Function Unlock: Boolean; virtual;
-    procedure WaitStrict; virtual;
-    Function Wait: Boolean; virtual;
-    Function TryWaitStrict: Boolean; virtual;
-    Function TryWait: Boolean; virtual;
-    Function TimedWait(Timeout: UInt32): TLSOWaitResult; virtual;
+    procedure WaitStrict; virtual; abstract;
+    Function Wait: Boolean; virtual; abstract;
+    Function TryWaitStrict: Boolean; virtual; abstract;
+    Function TryWait: Boolean; virtual; abstract;
+    Function TimedWait(Timeout: UInt32): TLSOWaitResult; virtual; abstract;
+  end;
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                               TSimpleManualEvent
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TSimpleManualEvent - class declaration
+===============================================================================}
+type
+  TSimpleManualEvent = class(TSimpleEventBase)
+  protected
+    class Function GetLockType: TLSOLockType; override;
+    procedure ResolveLockPtr; override;
+    procedure InitializeLock(InitializingData: PtrUInt); override;
+  public
+    procedure WaitStrict; override;
+    Function Wait: Boolean; override;
+    Function TryWaitStrict: Boolean; override;
+    Function TryWait: Boolean; override;
+    Function TimedWait(Timeout: UInt32): TLSOWaitResult; override;
+  end;
+
+  TSimpleEvent = TSimpleManualEvent;
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                TSimpleAutoEvent
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TSimpleAutoEvent - class declaration
+===============================================================================}
+type
+  TSimpleAutoEvent = class(TSimpleEventBase)
+  protected
+    class Function GetLockType: TLSOLockType; override;
+    procedure ResolveLockPtr; override;
+    procedure InitializeLock(InitializingData: PtrUInt); override;
+  public
+    procedure WaitStrict; override;
+    Function Wait: Boolean; override;
+    Function TryWaitStrict: Boolean; override;
+    Function TryWait: Boolean; override;
+    Function TimedWait(Timeout: UInt32): TLSOWaitResult; override;
   end;
 
 {===============================================================================
@@ -219,7 +263,30 @@ type
 {===============================================================================
     TEvent - class declaration
 ===============================================================================}
-{$message 'todo'}
+type
+  TEvent = class(TImplementorLinSyncObject)
+  protected
+    class Function GetLockType: TLSOLockType; override;
+    procedure ResolveLockPtr; override;
+    procedure InitializeLock(InitializingData: PtrUInt); override;
+    procedure FinalizeLock; override;
+    procedure LockData; virtual;
+    procedure UnlockData; virtual;
+  public
+    constructor Create(const Name: String; ManualReset,InitialState: Boolean); overload; virtual;
+    constructor Create(ManualReset,InitialState: Boolean); overload; virtual;
+    constructor Create(const Name: String); override; // ManualReset := True, InitialState := False
+    constructor Create; override;
+    procedure LockStrict; virtual;
+    Function Lock: Boolean; virtual;
+    procedure UnlockStrict; virtual;
+    Function Unlock: Boolean; virtual;
+    procedure WaitStrict; virtual;
+    Function Wait: Boolean; virtual;
+    Function TryWaitStrict: Boolean; virtual;
+    Function TryWait: Boolean; virtual;
+    Function TimedWait(Timeout: UInt32): TLSOWaitResult; virtual;
+  end;
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -447,7 +514,7 @@ implementation
 
 uses
   UnixType, Linux, Errors,
-  SimpleFutex, InterlockedOps;
+  SimpleFutex, InterlockedOps, BitOps;
 
 {$IFDEF FPC_DisableWarns}
   {$DEFINE FPCDWM}
@@ -594,12 +661,17 @@ const
 
 type
   TLSOSimpleEvent = record
-    Lock: TFutex;
+    Event:  TFutex;
   end;
 
 type
   TLSOEvent = record
+    DataLock:     TFutex;
+    WaitFutex:    TFutex;
+    Signaled:     Boolean;
+    ManualReset:  Boolean;
   end;
+  PLSOEvent = ^TLSOEvent;
 
 type
   TLSOAdvancedEvent = record
@@ -616,16 +688,17 @@ type
     SharedUserData: TLSOSharedUserData;
     RefCount:       Int32;
     case LockType: TLSOLockType of
-      ltSpinLock:       (SpinLock:      pthread_spinlock_t);
-      ltSimpleEvent:    (SimpleEvent:   TLSOSimpleEvent);
-      ltEvent:          (Event:         TLSOEvent);
-      ltAdvancedEVent:  (AdvancedEvent: TLSOAdvancedEvent);
-      ltMutex:          (Mutex:         pthread_mutex_t);
-      ltSemaphore:      (Semaphore:     sem_t);
-      ltRWLock:         (RWLock:        pthread_rwlock_t);
-      ltCondVar:        (CondVar:       pthread_cond_t);
-      ltCondVarEx:      (CondVarEx:     TLSOConditionVariableEx);
-      ltBarrier:        (Barrier:       pthread_barrier_t);
+      ltSpinLock:           (SpinLock:          pthread_spinlock_t);
+      ltSimpleManualEvent:  (SimpleManualEvent: TLSOSimpleEvent);
+      ltSimpleAutoEvent:    (SimpleAutoEvent:   TLSOSimpleEvent);
+      ltEvent:              (Event:             TLSOEvent);
+      ltAdvancedEVent:      (AdvancedEvent:     TLSOAdvancedEvent);
+      ltMutex:              (Mutex:             pthread_mutex_t);
+      ltSemaphore:          (Semaphore:         sem_t);
+      ltRWLock:             (RWLock:            pthread_rwlock_t);
+      ltCondVar:            (CondVar:           pthread_cond_t);
+      ltCondVarEx:          (CondVarEx:         TLSOConditionVariableEx);
+      ltBarrier:            (Barrier:           pthread_barrier_t);
   end;
   PLSOSharedData = ^TLSOSharedData;
 
@@ -962,135 +1035,610 @@ end;
 
 {===============================================================================
 --------------------------------------------------------------------------------
-                                  TSimpleEvent
+                                TSimpleEventBase
 --------------------------------------------------------------------------------
 ===============================================================================}
 const
-  LSO_EVENT_LOCKED   = TFutex(0);
-  LSO_EVENT_SIGNALED = TFutex(1);
+  LSO_SIMPLEEVENT_LOCKED   = TFutex(0);
+  LSO_SIMPLEEVENT_SIGNALED = TFutex(1);
 
 {===============================================================================
-    TSimpleEvent - class implementation
+    TSimpleEventBase - class implementation
 ===============================================================================}
 {-------------------------------------------------------------------------------
-    TSimpleEvent - protected methods
+    TSimpleEventBase - protected methods
 -------------------------------------------------------------------------------}
 
-class Function TSimpleEvent.GetLockType: TLSOLockType;
+procedure TSimpleEventBase.FinalizeLock;
 begin
-Result := ltSimpleEvent;
-end;
-
-//------------------------------------------------------------------------------
-
-procedure TSimpleEvent.ResolveLockPtr;
-begin
-fLockPtr := Addr(PLSOSharedData(fSharedData)^.SimpleEvent);
-end;
-
-//------------------------------------------------------------------------------
-
-{$IFDEF FPCDWM}{$PUSH}W5024{$ENDIF}
-procedure TSimpleEvent.InitializeLock(InitializingData: PtrUInt);
-begin
-InterlockedStore(PLSOSharedData(fSharedData)^.SimpleEvent.Lock,LSO_EVENT_LOCKED);
-end;
-{$IFDEF FPCDWM}{$POP}{$ENDIF}
-
-//------------------------------------------------------------------------------
-
-procedure TSimpleEvent.FinalizeLock;
-begin
-InterlockedStore(PLSOSharedData(fSharedData)^.SimpleEvent.Lock,LSO_EVENT_LOCKED);
+// no need to do anything
 end;
 
 {-------------------------------------------------------------------------------
-    TSimpleEvent - public methods
+    TSimpleEventBase - public methods
 -------------------------------------------------------------------------------}
 
-procedure TSimpleEvent.LockStrict;
+procedure TSimpleEventBase.LockStrict;
 begin
-InterlockedExchange32(fLockPtr,LSO_EVENT_LOCKED);
+InterlockedStore32(fLockPtr,LSO_SIMPLEEVENT_LOCKED);
 // do not wake any thread
 end;
 
 //------------------------------------------------------------------------------
 
-Function TSimpleEvent.Lock: Boolean;
+Function TSimpleEventBase.Lock: Boolean;
 begin
-InterlockedExchange32(fLockPtr,LSO_EVENT_LOCKED);
+InterlockedStore32(fLockPtr,LSO_SIMPLEEVENT_LOCKED);
 Result := True;
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TSimpleEvent.UnlockStrict;
+procedure TSimpleEventBase.UnlockStrict;
 begin
-InterlockedExchange32(fLockPtr,LSO_EVENT_SIGNALED);
+InterlockedStore32(fLockPtr,LSO_SIMPLEEVENT_SIGNALED);
 // wake everyone
 FutexWake(PFutex(fLockPtr)^,-1);
 end;
 
 //------------------------------------------------------------------------------
 
-Function TSimpleEvent.Unlock: Boolean;
+Function TSimpleEventBase.Unlock: Boolean;
 begin
-InterlockedExchange32(fLockPtr,LSO_EVENT_SIGNALED);
+InterlockedStore32(fLockPtr,LSO_SIMPLEEVENT_SIGNALED);
 FutexWake(PFutex(fLockPtr)^,-1);
 Result := True;
 end;
 
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                               TSimpleManualEvent
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TSimpleManualEvent - class implementation
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TSimpleManualEvent - protected methods
+-------------------------------------------------------------------------------}
+
+class Function TSimpleManualEvent.GetLockType: TLSOLockType;
+begin
+Result := ltSimpleManualEvent;
+end;
+
 //------------------------------------------------------------------------------
 
-procedure TSimpleEvent.WaitStrict;
+procedure TSimpleManualEvent.ResolveLockPtr;
+begin
+fLockPtr := Addr(PLSOSharedData(fSharedData)^.SimpleManualEvent.Event);
+end;
+
+//------------------------------------------------------------------------------
+
+{$IFDEF FPCDWM}{$PUSH}W5024{$ENDIF}
+procedure TSimpleManualEvent.InitializeLock(InitializingData: PtrUInt);
+begin
+InterlockedStore(PLSOSharedData(fSharedData)^.SimpleManualEvent.Event,LSO_SIMPLEEVENT_LOCKED);
+end;
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
+
+{-------------------------------------------------------------------------------
+    TSimpleManualEvent - public methods
+-------------------------------------------------------------------------------}
+
+procedure TSimpleManualEvent.WaitStrict;
 var
   WaitResult: TFutexWaitResult;
 begin
-WaitResult := FutexWait(PFutex(fLockPtr)^,LSO_EVENT_LOCKED);
-If not(WaitResult in [fwrWoken,fwrValue]) then
-  raise ELSOFutexWaitError.CreateFmt('TSimpleEvent.WaitStrict: ' +
-    'Invalid futex wait result (%d)',[Ord(WaitResult)]);
-end;
-
-//------------------------------------------------------------------------------
-
-Function TSimpleEvent.Wait: Boolean;
-begin
-Result := FutexWait(PFutex(fLockPtr)^,LSO_EVENT_LOCKED) in [fwrWoken,fwrValue];
-fLastError := 0;
-end;
-
-//------------------------------------------------------------------------------
-
-Function TSimpleEvent.TryWaitStrict: Boolean;
-begin
-Result := InterlockedLoad32(fLockPtr) <> LSO_EVENT_LOCKED;
-end;
-
-//------------------------------------------------------------------------------
-
-Function TSimpleEvent.TryWait: Boolean;
-begin
-Result := InterlockedLoad32(fLockPtr) <> LSO_EVENT_LOCKED;
-end;
-
-//------------------------------------------------------------------------------
-
-Function TSimpleEvent.TimedWait(Timeout: UInt32): TLSOWaitResult;
-begin
+repeat
 {
-  When fwrValue is returned, it means the futex contained value other than
-  LSO_EVENT_LOCKED, which means it is not locked, and therefore is signaled.
+  If the event is unlocked, then the following wait will immeditely return with
+  result set to fwrValue.
 }
-case FutexWait(PFutex(fLockPtr)^,LSO_EVENT_LOCKED,Timeout) of
-  fwrWoken,
-  fwrValue:   Result := wrSignaled;
-  fwrTimeout: Result := wrTimeout;
-else
-  Result := wrError;
-  fLastError := 0;
+  WaitResult := FutexWait(PFutex(fLockPtr)^,LSO_SIMPLEEVENT_LOCKED);
+  If not(WaitResult in [fwrWoken,fwrValue]) then
+    raise ELSOFutexWaitError.CreateFmt('TSimpleManualEvent.WaitStrict: ' +
+      'Invalid futex wait result (%d)',[Ord(WaitResult)]);
+until InterlockedLoad32(fLockPtr) = LSO_SIMPLEEVENT_SIGNALED;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSimpleManualEvent.Wait: Boolean;
+begin
+repeat
+  Result := FutexWait(PFutex(fLockPtr)^,LSO_SIMPLEEVENT_LOCKED) in [fwrWoken,fwrValue];
+  If not Result then
+    Break{repeat};
+until InterlockedLoad32(fLockPtr) = LSO_SIMPLEEVENT_SIGNALED;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSimpleManualEvent.TryWaitStrict: Boolean;
+begin
+Result := InterlockedLoad32(fLockPtr) = LSO_SIMPLEEVENT_SIGNALED;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSimpleManualEvent.TryWait: Boolean;
+begin
+Result := InterlockedLoad32(fLockPtr) = LSO_SIMPLEEVENT_SIGNALED;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSimpleManualEvent.TimedWait(Timeout: UInt32): TLSOWaitResult;
+var
+  ExitWait: Boolean;
+begin
+repeat
+  ExitWait := True;
+  case FutexWait(PFutex(fLockPtr)^,LSO_SIMPLEEVENT_LOCKED,Timeout) of
+  {
+    Futex was woken, but that does not necessarily mean it was signaled, so
+    check the state.
+    Note that it is possible that the futex was woken with unlocked state, but
+    before it got here, the state changed back to locked.
+  }
+    fwrWoken:   If InterlockedLoad32(fLockPtr) = LSO_SIMPLEEVENT_SIGNALED then
+                  Result := wrSignaled
+                else
+                  ExitWait := False;
+  {
+    When fwrValue is returned, it means the futex contained value other than
+    LSO_EVENT_LOCKED, which means it is not locked, and therefore is considered
+    signaled.
+  }
+    fwrValue:   Result := wrSignaled;
+    fwrTimeout: Result := wrTimeout;
+  else
+    Result := wrError;
+  end;
+until ExitWait;
+end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                TSimpleAutoEvent
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TSimpleAutoEvent - class implementation
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TSimpleAutoEvent - protected methods
+-------------------------------------------------------------------------------}
+
+class Function TSimpleAutoEvent.GetLockType: TLSOLockType;
+begin
+Result := ltSimpleAutoEvent;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TSimpleAutoEvent.ResolveLockPtr;
+begin
+fLockPtr := Addr(PLSOSharedData(fSharedData)^.SimpleAutoEvent.Event);
+end;
+
+//------------------------------------------------------------------------------
+
+{$IFDEF FPCDWM}{$PUSH}W5024{$ENDIF}
+procedure TSimpleAutoEvent.InitializeLock(InitializingData: PtrUInt);
+begin
+InterlockedStore(PLSOSharedData(fSharedData)^.SimpleAutoEvent.Event,LSO_SIMPLEEVENT_LOCKED);
+end;
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
+
+{-------------------------------------------------------------------------------
+    TSimpleAutoEvent - public methods
+-------------------------------------------------------------------------------}
+
+procedure TSimpleAutoEvent.WaitStrict;
+var
+  ExitWait:   Boolean;
+  WaitResult: TFutexWaitResult;
+begin
+repeat
+  // lock the event and check what was its original state
+  If InterlockedExchange32(fLockPtr,LSO_SIMPLEEVENT_LOCKED) = LSO_SIMPLEEVENT_LOCKED then
+    begin
+      // event was already locked, enter waiting
+      ExitWait := False;
+      WaitResult := FutexWait(PFutex(fLockPtr)^,LSO_SIMPLEEVENT_LOCKED);
+      If not(WaitResult in [fwrWoken,fwrValue]) then
+        raise ELSOFutexWaitError.CreateFmt('TSimpleManualEvent.WaitStrict: ' +
+          'Invalid futex wait result (%d)',[Ord(WaitResult)]);
+      // reapeat the lock-or-wait cycle
+    end
+  // event was unlocked (and is now locked), exit
+  else ExitWait := True;
+until ExitWait;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSimpleAutoEvent.Wait: Boolean;
+var
+  ExitWait: Boolean;
+begin
+Result := False;
+repeat
+  If InterlockedExchange32(fLockPtr,LSO_SIMPLEEVENT_LOCKED) = LSO_SIMPLEEVENT_LOCKED then
+    begin
+      ExitWait := False;
+      If not(FutexWait(PFutex(fLockPtr)^,LSO_SIMPLEEVENT_LOCKED) in [fwrWoken,fwrValue]) then
+        Break{repeat};
+    end
+  else
+    begin
+      ExitWait := True;
+      Result := True;
+    end;
+until ExitWait;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSimpleAutoEvent.TryWaitStrict: Boolean;
+begin
+Result := InterlockedExchange32(fLockPtr,LSO_SIMPLEEVENT_LOCKED) = LSO_SIMPLEEVENT_SIGNALED;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSimpleAutoEvent.TryWait: Boolean;
+begin
+Result := InterlockedExchange32(fLockPtr,LSO_SIMPLEEVENT_LOCKED) = LSO_SIMPLEEVENT_SIGNALED;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TSimpleAutoEvent.TimedWait(Timeout: UInt32): TLSOWaitResult;
+var
+  ExitWait: Boolean;
+begin
+repeat
+  ExitWait := True;
+  // lock the event and check what was its original state
+  If InterlockedExchange32(fLockPtr,LSO_SIMPLEEVENT_LOCKED) = LSO_SIMPLEEVENT_LOCKED then
+    begin
+      // event was already locked, enter waiting
+      case FutexWait(PFutex(fLockPtr)^,LSO_SIMPLEEVENT_LOCKED,Timeout) of
+        fwrWoken,
+        fwrValue:   ExitWait := False;  // event seems to be unlocked, repeat lock cycle
+        fwrTimeout: begin
+                      // retry locking the event
+                      If InterlockedExchange32(fLockPtr,LSO_SIMPLEEVENT_LOCKED) = LSO_SIMPLEEVENT_SIGNALED then
+                        Result := wrSignaled
+                      else
+                        Result := wrTimeout;
+                    end;
+      else
+        Result := wrError;
+      end;
+    end
+  // event was unlocked (and is now locked)
+  else Result := wrSignaled;
+until ExitWait;
+end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                     TEvent
+--------------------------------------------------------------------------------
+===============================================================================}
+const
+  LSO_EVENT_INITDATABIT_STATE    = 0;
+  LSO_EVENT_INITDATABIT_MANRESET = 1;
+
+{===============================================================================
+    TEvent - class implementation
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TEvent - protected methods
+-------------------------------------------------------------------------------}
+
+class Function TEvent.GetLockType: TLSOLockType;
+begin
+Result := ltEvent;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TEvent.ResolveLockPtr;
+begin
+fLockPtr := Addr(PLSOSharedData(fSharedData)^.Event);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TEvent.InitializeLock(InitializingData: PtrUInt);
+begin
+SimpleFutexInit(PLSOSharedData(fSharedData)^.Event.DataLock);
+PLSOSharedData(fSharedData)^.Event.WaitFutex := 0;
+LockData;
+try
+  PLSOSharedData(fSharedData)^.Event.Signaled := BT(InitializingData,LSO_EVENT_INITDATABIT_STATE);
+  PLSOSharedData(fSharedData)^.Event.ManualReset := BT(InitializingData,LSO_EVENT_INITDATABIT_MANRESET);
+finally
+  UnlockData;
 end;
 end;
+
+//------------------------------------------------------------------------------
+
+procedure TEvent.FinalizeLock;
+begin
+// nothing to do
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TEvent.LockData;
+begin
+SimpleFutexLock(PLSOSharedData(fSharedData)^.Event.DataLock);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TEvent.UnlockData;
+begin
+SimpleFutexUnlock(PLSOSharedData(fSharedData)^.Event.DataLock);
+end;
+
+{-------------------------------------------------------------------------------
+    TEvent - public methods
+-------------------------------------------------------------------------------}
+
+constructor TEvent.Create(const Name: String; ManualReset,InitialState: Boolean);
+var
+  InitData: PtrUInt;
+begin
+InitData := 0;
+BitSetTo(InitData,LSO_EVENT_INITDATABIT_STATE,InitialState);
+BitSetTo(InitData,LSO_EVENT_INITDATABIT_MANRESET,ManualReset);
+ProtectedCreate(Name,InitData);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TEvent.Create(ManualReset,InitialState: Boolean);
+var
+  InitData: PtrUInt;
+begin
+InitData := 0;
+BitSetTo(InitData,LSO_EVENT_INITDATABIT_STATE,InitialState);
+BitSetTo(InitData,LSO_EVENT_INITDATABIT_MANRESET,ManualReset);
+ProtectedCreate('',InitData);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TEvent.Create(const Name: String);
+var
+  InitData: PtrUInt;
+begin
+InitData := 0;
+BTS(InitData,LSO_EVENT_INITDATABIT_MANRESET);
+ProtectedCreate(Name,InitData);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TEvent.Create;
+var
+  InitData: PtrUInt;
+begin
+InitData := 0;
+BTS(InitData,LSO_EVENT_INITDATABIT_MANRESET);
+ProtectedCreate('',InitData);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TEvent.LockStrict;
+begin
+LockData;
+try
+  PLSOEvent(fLockPtr)^.Signaled := False;
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TEvent.Lock: Boolean;
+begin
+LockData;
+try
+  PLSOEvent(fLockPtr)^.Signaled := False;
+  Result := True;
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TEvent.UnlockStrict;
+begin
+LockData;
+try
+  PLSOEvent(fLockPtr)^.Signaled := True;
+  If PLSOEvent(fLockPtr)^.ManualReset then
+    FutexWake(PLSOEvent(fLockPtr)^.WaitFutex,-1)
+  else
+    FutexWake(PLSOEvent(fLockPtr)^.WaitFutex,1);
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TEvent.Unlock: Boolean;
+begin
+LockData;
+try
+  PLSOEvent(fLockPtr)^.Signaled := True;
+  If PLSOEvent(fLockPtr)^.ManualReset then
+    FutexWake(PLSOEvent(fLockPtr)^.WaitFutex,-1)
+  else
+    FutexWake(PLSOEvent(fLockPtr)^.WaitFutex,1);
+  Result := True;
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TEvent.WaitStrict;
+var
+  ExitWait:   Boolean;
+  WaitResult: TFutexWaitResult;
+begin
+LockData;
+try
+  repeat
+    ExitWait := True;
+    If not PLSOEvent(fLockPtr)^.Signaled then
+      begin
+        UnlockData;
+        try
+          WaitResult := FutexWait(PLSOEvent(fLockPtr)^.WaitFutex,0);
+        finally
+          LockData;
+        end;
+        If WaitResult <> fwrWoken then
+          raise ELSOFutexWaitError.CreateFmt('TEvent.WaitStrict: ' +
+            'Invalid futex wait result (%d)',[Ord(WaitResult)]);
+      end;
+    If PLSOEvent(fLockPtr)^.Signaled then
+      begin
+        If not PLSOEvent(fLockPtr)^.ManualReset then
+          PLSOEvent(fLockPtr)^.Signaled := False;
+      end
+    else ExitWait := False;
+  until ExitWait
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TEvent.Wait: Boolean;
+var
+  ExitWait:   Boolean;
+  WaitResult: TFutexWaitResult;
+begin
+Result := False;
+LockData;
+try
+  repeat
+    ExitWait := True;
+    If not PLSOEvent(fLockPtr)^.Signaled then
+      begin
+        UnlockData;
+        try
+          WaitResult := FutexWait(PLSOEvent(fLockPtr)^.WaitFutex,0);
+        finally
+          LockData;
+        end;
+        If WaitResult <> fwrWoken then
+          Break{repeat};
+      end;
+    If PLSOEvent(fLockPtr)^.Signaled then
+      begin
+        If not PLSOEvent(fLockPtr)^.ManualReset then
+          PLSOEvent(fLockPtr)^.Signaled := False;
+        Result := True;
+      end
+    else ExitWait := False;
+  until ExitWait
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TEvent.TryWaitStrict: Boolean;
+begin
+LockData;
+try
+  Result := PLSOEvent(fLockPtr)^.Signaled;
+  If not PLSOEvent(fLockPtr)^.ManualReset then
+    PLSOEvent(fLockPtr)^.Signaled := False;
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TEvent.TryWait: Boolean;
+begin
+LockData;
+try
+  Result := PLSOEvent(fLockPtr)^.Signaled;
+  If not PLSOEvent(fLockPtr)^.ManualReset then
+    PLSOEvent(fLockPtr)^.Signaled := False;
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TEvent.TimedWait(Timeout: UInt32): TLSOWaitResult;
+var
+  ExitWait:   Boolean;
+  WaitResult: TFutexWaitResult;
+begin
+// note that time spent in data locking is ignored and is not projected to timeout
+LockData;
+try
+  repeat
+    ExitWait := True;
+    If not PLSOEvent(fLockPtr)^.Signaled then
+      begin
+        UnlockData;
+        try
+          WaitResult := FutexWait(PLSOEvent(fLockPtr)^.WaitFutex,0,Timeout);
+        finally
+          LockData;
+        end;
+        case WaitResult of
+          fwrWoken:   Result := wrSignaled;
+          fwrTimeout: Result := wrTimeout;
+        else
+          Result := wrError;
+        end;
+      end;
+    If PLSOEvent(fLockPtr)^.Signaled then
+      begin
+        If not PLSOEvent(fLockPtr)^.ManualReset then
+          PLSOEvent(fLockPtr)^.Signaled := False;
+        Result := wrSignaled;
+      end
+    else If Result <> wrTimeout then
+      ExitWait := False;
+  until ExitWait
+finally
+  UnlockData;
+end;
+end;
+
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -1967,9 +2515,6 @@ begin
 // data-lock mutex
 If CheckResErr(pthread_mutexattr_init(@MutexAttr)) then
   try
-    If not CheckResErr(pthread_mutexattr_settype(@MutexAttr,PTHREAD_MUTEX_RECURSIVE)) then
-      raise ELSOSysOpError.CreateFmt('TConditionVariableEx.InitializeLock: ' +
-        'Failed to set data-lock mutex attribute TYPE (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
     If fProcessShared then
       If not CheckResErr(pthread_mutexattr_setpshared(@MutexAttr,PTHREAD_PROCESS_SHARED)) then
         raise ELSOSysOpError.CreateFmt('TConditionVariableEx.InitializeLock: ' +
