@@ -40,7 +40,7 @@ type
   ELSOInvalidLockType = class(ELSOException);
   ELSOInvalidObject   = class(ELSOException);
 
-  ELSOFutexWaitError = class(ELSOException);
+  ELSOFutexOpError = class(ELSOException);
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -1139,7 +1139,7 @@ repeat
 }
   WaitResult := FutexWait(PFutex(fLockPtr)^,LSO_SIMPLEEVENT_LOCKED);
   If not(WaitResult in [fwrWoken,fwrValue]) then
-    raise ELSOFutexWaitError.CreateFmt('TSimpleManualEvent.WaitStrict: ' +
+    raise ELSOFutexOpError.CreateFmt('TSimpleManualEvent.WaitStrict: ' +
       'Invalid futex wait result (%d)',[Ord(WaitResult)]);
 until InterlockedLoad32(fLockPtr) = LSO_SIMPLEEVENT_SIGNALED;
 end;
@@ -1252,7 +1252,7 @@ repeat
       ExitWait := False;
       WaitResult := FutexWait(PFutex(fLockPtr)^,LSO_SIMPLEEVENT_LOCKED);
       If not(WaitResult in [fwrWoken,fwrValue]) then
-        raise ELSOFutexWaitError.CreateFmt('TSimpleManualEvent.WaitStrict: ' +
+        raise ELSOFutexOpError.CreateFmt('TSimpleManualEvent.WaitStrict: ' +
           'Invalid futex wait result (%d)',[Ord(WaitResult)]);
       // reapeat the lock-or-wait cycle
     end
@@ -1473,10 +1473,17 @@ begin
 LockData;
 try
   PLSOEvent(fLockPtr)^.Signaled := True;
-  If PLSOEvent(fLockPtr)^.ManualReset then
-    FutexWake(PLSOEvent(fLockPtr)^.WaitFutex,-1)
-  else
-    FutexWake(PLSOEvent(fLockPtr)^.WaitFutex,1);
+{
+  All waitings (FutexWait) are immediately followed by data lock. So if we wake
+  any thread, it will just run into locked data lock.
+  To prevent this, we requeue all threads waiting on this event to wait on the
+  data lock. Internal workings of the data lock then takes care of them.
+
+  No waiting thread is explicitly woken.
+}
+  If FutexCmpRequeue(PLSOEvent(fLockPtr)^.WaitFutex,0,PLSOEvent(fLockPtr)^.DataLock,0,MAXINT) < 0 then
+    raise ELSOFutexOpError.Create('TEvent.UnlockStrict: Failed to requeue waiters.');
+  SimpleFutexQueue(PLSOEvent(fLockPtr)^.DataLock);
 finally
   UnlockData;
 end;
@@ -1489,11 +1496,8 @@ begin
 LockData;
 try
   PLSOEvent(fLockPtr)^.Signaled := True;
-  If PLSOEvent(fLockPtr)^.ManualReset then
-    FutexWake(PLSOEvent(fLockPtr)^.WaitFutex,-1)
-  else
-    FutexWake(PLSOEvent(fLockPtr)^.WaitFutex,1);
-  Result := True;
+  Result := FutexCmpRequeue(PLSOEvent(fLockPtr)^.WaitFutex,0,PLSOEvent(fLockPtr)^.DataLock,0,MAXINT) >= 0;
+  SimpleFutexQueue(PLSOEvent(fLockPtr)^.DataLock);
 finally
   UnlockData;
 end;
@@ -1519,7 +1523,7 @@ try
           LockData;
         end;
         If WaitResult <> fwrWoken then
-          raise ELSOFutexWaitError.CreateFmt('TEvent.WaitStrict: ' +
+          raise ELSOFutexOpError.CreateFmt('TEvent.WaitStrict: ' +
             'Invalid futex wait result (%d)',[Ord(WaitResult)]);
       end;
     If PLSOEvent(fLockPtr)^.Signaled then
