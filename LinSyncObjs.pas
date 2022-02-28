@@ -18,7 +18,8 @@ interface
 
 uses
   SysUtils, BaseUnix, PThreads,
-  AuxTypes, AuxClasses, NamedSharedItems;
+  AuxTypes, AuxClasses, BitVector, SimpleFutex, SharedMemoryStream,
+  NamedSharedItems;
 
 {$IFDEF FPC_DisableWarns}
   {$DEFINE FPCDWM}
@@ -41,6 +42,9 @@ type
   ELSOInvalidObject   = class(ELSOException);
 
   ELSOFutexOpError = class(ELSOException);
+
+  ELSOMultiWaitError   = class(ELSOException);
+  ELSOIndexOutOfBounds = class(ELSOException);
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -290,13 +294,74 @@ type
 
 {===============================================================================
 --------------------------------------------------------------------------------
+                               TLSOMultiWaitSlots
+--------------------------------------------------------------------------------
+===============================================================================}
+type
+  TLSOMultiWaitSlotIndex = Int16;
+
+{===============================================================================
+    TLSOMultiWaitSlots - class declaration
+===============================================================================}
+type
+  TLSOMultiWaitSlots = class(TSharedMemory)
+  protected
+    fSlotCount:   Integer;
+    fSlotMap:     TBitVector;
+    fSlotMemory:  Pointer;
+    Function GetSlot(SlotIndex: TLSOMultiWaitSlotIndex): PFutex; virtual;
+    procedure Initialize; override;
+    procedure Finalize; override;
+  public
+    constructor Create;
+    Function GetFreeSlotIndex(out SlotIndex: TLSOMultiWaitSlotIndex): Boolean; virtual;
+    procedure InvalidateSlot(SlotIndex: TLSOMultiWaitSlotIndex); virtual;
+    Function CheckIndex(SlotIndex: TLSOMultiWaitSlotIndex): Boolean; virtual;
+    property Count: Integer read fSlotCount;
+    property SlotPtrs[SlotIndex: TLSOMultiWaitSlotIndex]: PFutex read GetSlot; default;
+  end;
+
+{===============================================================================
+--------------------------------------------------------------------------------
                                  TAdvancedEvent
 --------------------------------------------------------------------------------
 ===============================================================================}
 {===============================================================================
     TAdvancedEvent - class declaration
 ===============================================================================}
-{$message 'todo'}
+type
+  TAdvancedEvent = class(TImplementorLinSyncObject)
+  protected
+    fMultiWaitSlots:  TLSOMultiWaitSlots;
+    class Function GetLockType: TLSOLockType; override;
+    procedure ResolveLockPtr; override;
+    procedure InitializeLock(InitializingData: PtrUInt); override;
+    procedure FinalizeLock; override;
+    procedure LockData; virtual;
+    procedure UnlockData; virtual;
+    procedure Initialize(const Name: String; InitializingData: PtrUInt); override;
+    procedure Initialize(const Name: String); override;
+    procedure Finalize; override;
+    // multi-wait methods
+    procedure AddWaiter(SlotIndex: TLSOMultiWaitSlotIndex; WaitAll: Boolean); virtual;
+    procedure RemoveWaiter(SlotIndex: TLSOMultiWaitSlotIndex); virtual;
+    procedure WasLocked; virtual;
+    procedure WasUnlocked; virtual;
+  public
+    constructor Create(const Name: String; ManualReset,InitialState: Boolean); overload; virtual;
+    constructor Create(ManualReset,InitialState: Boolean); overload; virtual;
+    constructor Create(const Name: String); override;
+    constructor Create; override;
+    procedure LockStrict; virtual;
+    Function Lock: Boolean; virtual;
+    procedure UnlockStrict; virtual;
+    Function Unlock: Boolean; virtual;
+    procedure WaitStrict; virtual;
+    Function Wait: Boolean; virtual;
+    Function TryWaitStrict: Boolean; virtual;
+    Function TryWait: Boolean; virtual;
+    Function TimedWait(Timeout: UInt32): TLSOWaitResult; virtual;
+  end;
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -499,6 +564,16 @@ type
 
 {===============================================================================
 --------------------------------------------------------------------------------
+                                 Wait functions
+--------------------------------------------------------------------------------
+===============================================================================}
+
+Function WaitForMultipleObjects(Objects: array of TAdvancedEvent; WaitAll: Boolean; Timeout: DWORD; out Index: Integer): TLSOWaitResult;
+Function WaitForMultipleObjects(Objects: array of TAdvancedEvent; WaitAll: Boolean; Timeout: DWORD): TLSOWaitResult;
+Function WaitForMultipleObjects(Objects: array of TAdvancedEvent; WaitAll: Boolean): TLSOWaitResult;
+
+{===============================================================================
+--------------------------------------------------------------------------------
                                Utility functions
 --------------------------------------------------------------------------------
 ===============================================================================}
@@ -508,13 +583,11 @@ type
 }
 Function WaitResultToStr(WaitResult: TLSOWaitResult): String;
 
-procedure Foo;
-
 implementation
 
 uses
   UnixType, Linux, Errors,
-  SimpleFutex, InterlockedOps, BitOps;
+  InterlockedOps, BitOps;
 
 {$IFDEF FPC_DisableWarns}
   {$DEFINE FPCDWM}
@@ -674,8 +747,20 @@ type
   PLSOEvent = ^TLSOEvent;
 
 type
-  TLSOAdvancedEvent = record
+  TLSOWaiterItem = packed record
+    SlotIndex:  TLSOMultiWaitSlotIndex;
+    WaitAll:    Boolean;
   end;
+
+  TLSOAdvancedEvent = record
+    DataLock:     TFutex;
+    WaitFutex:    TFutex;
+    Signaled:     Boolean;
+    ManualReset:  Boolean;
+    WaiterCount:  Integer;
+    WaiterArray:  packed array[0..15] of TLSOWaiterItem;
+  end;
+  PLSOAdvancedEvent = ^TLSOAdvancedEvent;
 
 type
   TLSOConditionVariableEx = record
@@ -692,7 +777,7 @@ type
       ltSimpleManualEvent:  (SimpleManualEvent: TLSOSimpleEvent);
       ltSimpleAutoEvent:    (SimpleAutoEvent:   TLSOSimpleEvent);
       ltEvent:              (Event:             TLSOEvent);
-      ltAdvancedEVent:      (AdvancedEvent:     TLSOAdvancedEvent);
+      ltAdvancedEvent:      (AdvancedEvent:     TLSOAdvancedEvent);
       ltMutex:              (Mutex:             pthread_mutex_t);
       ltSemaphore:          (Semaphore:         sem_t);
       ltRWLock:             (RWLock:            pthread_rwlock_t);
@@ -701,11 +786,6 @@ type
       ltBarrier:            (Barrier:           pthread_barrier_t);
   end;
   PLSOSharedData = ^TLSOSharedData;
-
-procedure Foo;
-begin
-writeln(sizeof(TLSOSharedData));
-end;
 
 //------------------------------------------------------------------------------
 
@@ -716,7 +796,7 @@ If not CheckErr(clock_gettime(CLOCK_REALTIME,@TimeoutSpec)) then
     'Failed to obtain current time (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 TimeoutSpec.tv_sec := TimeoutSpec.tv_sec + time_t(Timeout div 1000);
 TimeoutSpec.tv_nsec := TimeoutSpec.tv_nsec + clong((Timeout mod 1000) * 1000000);
-If TimeoutSpec.tv_nsec > 1000000000 then
+If TimeoutSpec.tv_nsec >= 1000000000 then
   begin
     Inc(TimeoutSpec.tv_sec);
     TimeoutSpec.tv_nsec := TimeoutSpec.tv_nsec - 1000000000;
@@ -1610,6 +1690,7 @@ var
   WaitResult: TFutexWaitResult;
 begin
 // note that time spent in data locking is ignored and is not projected to timeout
+Result := wrError;
 LockData;
 try
   repeat
@@ -1633,6 +1714,549 @@ try
       begin
         If not PLSOEvent(fLockPtr)^.ManualReset then
           PLSOEvent(fLockPtr)^.Signaled := False;
+        Result := wrSignaled;
+      end
+    else If Result <> wrTimeout then
+      ExitWait := False;
+  until ExitWait
+finally
+  UnlockData;
+end;
+end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                               TLSOMultiWaitSlots
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TLSOMultiWaitSlots - class implementation
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TLSOMultiWaitSlots - protected methods
+-------------------------------------------------------------------------------}
+
+Function TLSOMultiWaitSlots.GetSlot(SlotIndex: TLSOMultiWaitSlotIndex): PFutex;
+begin
+If CheckIndex(SlotIndex) then
+  Result := PFutex(PtrAdvance(fSlotMemory,SlotIndex,SizeOf(TFutex)))
+else
+  raise ELSOIndexOutOfBounds.CreateFmt('TLSOMultiWaitSlots.GetSlot: Slot index (%d) out of bounds.',[SlotIndex]);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TLSOMultiWaitSlots.Initialize;
+begin
+inherited;
+fSlotCount := 15360;  // 15 * 1024
+fSlotMap := TBitVector.Create(fMemory,fSlotCount);
+fSlotMemory := PtrAdvance(fMemory,2048);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TLSOMultiWaitSlots.Finalize;
+begin
+fSlotMemory := nil;
+fSlotMap.Free;
+inherited;
+end;
+
+{-------------------------------------------------------------------------------
+    TLSOMultiWaitSlots - public methods
+-------------------------------------------------------------------------------}
+
+constructor TLSOMultiWaitSlots.Create;
+begin
+inherited Create(65536{64KiB},'lso_multiwaitslots');
+end;
+
+//------------------------------------------------------------------------------
+
+Function TLSOMultiWaitSlots.GetFreeSlotIndex(out SlotIndex: TLSOMultiWaitSlotIndex): Boolean;
+begin
+Lock;
+try
+  SlotIndex := TLSOMultiWaitSlotIndex(fSlotMap.FirstClean);
+  Result := CheckIndex(SlotIndex);
+finally
+  Unlock;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TLSOMultiWaitSlots.InvalidateSlot(SlotIndex: TLSOMultiWaitSlotIndex);
+begin
+Lock;
+try
+  If CheckIndex(SlotIndex) then
+    begin
+      fSlotMap[SlotIndex] := False;
+      PFutex(PtrAdvance(fSlotMemory,SlotIndex,SizeOf(TFutex)))^ := 0;
+    end
+  else ELSOIndexOutOfBounds.CreateFmt('TLSOMultiWaitSlots.InvalidateSlot: Slot index (%d) out of bounds.',[SlotIndex]);
+finally
+  Unlock;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TLSOMultiWaitSlots.CheckIndex(SlotIndex: TLSOMultiWaitSlotIndex): Boolean;
+begin
+Result := (SlotIndex >= 0) and (SlotIndex < fSlotCount);
+end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                 TAdvancedEvent
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TAdvancedEvent - class implementation
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TAdvancedEvent - protected methods
+-------------------------------------------------------------------------------}
+
+class Function TAdvancedEvent.GetLockType: TLSOLockType;
+begin
+Result := ltAdvancedEvent;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TAdvancedEvent.ResolveLockPtr;
+begin
+fLockPtr := Addr(PLSOSharedData(fSharedData)^.AdvancedEvent);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TAdvancedEvent.InitializeLock(InitializingData: PtrUInt);
+begin
+SimpleFutexInit(PLSOSharedData(fSharedData)^.AdvancedEvent.DataLock);
+PLSOSharedData(fSharedData)^.AdvancedEvent.WaitFutex := 0;
+LockData;
+try
+  PLSOSharedData(fSharedData)^.AdvancedEvent.Signaled := BT(InitializingData,LSO_EVENT_INITDATABIT_STATE);
+  PLSOSharedData(fSharedData)^.AdvancedEvent.ManualReset := BT(InitializingData,LSO_EVENT_INITDATABIT_MANRESET);
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TAdvancedEvent.FinalizeLock;
+begin
+// nothing to do
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TAdvancedEvent.LockData;
+begin
+SimpleFutexLock(PLSOSharedData(fSharedData)^.AdvancedEvent.DataLock);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TAdvancedEvent.UnlockData;
+begin
+SimpleFutexUnlock(PLSOSharedData(fSharedData)^.AdvancedEvent.DataLock);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TAdvancedEvent.Initialize(const Name: String; InitializingData: PtrUInt);
+begin
+inherited Initialize(Name,InitializingData);
+fMultiWaitSlots := TLSOMultiWaitSlots.Create;
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+procedure TAdvancedEvent.Initialize(const Name: String);
+begin
+inherited Initialize(Name);
+fMultiWaitSlots := TLSOMultiWaitSlots.Create;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TAdvancedEvent.Finalize;
+begin
+fMultiWaitSlots.Free;
+inherited;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TAdvancedEvent.AddWaiter(SlotIndex: TLSOMultiWaitSlotIndex; WaitAll: Boolean);
+begin
+LockData;
+try
+  with PLSOAdvancedEvent(fLockPtr)^ do
+    begin
+      If WaiterCount < Length(WaiterArray) then
+        begin
+          WaiterArray[WaiterCount].SlotIndex := SlotIndex;
+          WaiterArray[WaiterCount].WaitAll := WaitAll;
+          If PLSOAdvancedEvent(fLockPtr)^.Signaled then
+            InterlockedDecrement(fMultiWaitSlots[WaiterArray[WaiterCount].SlotIndex]^);
+          Inc(WaiterCount);
+        end
+      else raise ELSOMultiWaitError.Create('TAdvancedEvent.AddWaiter: Waiter list full.');
+    end;
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TAdvancedEvent.RemoveWaiter(SlotIndex: TLSOMultiWaitSlotIndex);
+var
+  i:      Integer;
+  Index:  Integer;
+begin
+LockData;
+try
+  with PLSOAdvancedEvent(fLockPtr)^ do
+    begin
+      // find the futex
+      Index := -1;
+      For i := Low(WaiterArray) to Pred(WaiterCount) do
+        If WaiterArray[i].SlotIndex = SlotIndex then
+          begin
+            Index := i;
+            Break{For i};
+          end;
+      // now remove it
+      If Index >= 0 then
+        begin
+          For i := Index to (WaiterCount - 2) do
+            WaiterArray[i] := WaiterArray[i + 1];
+          Dec(WaiterCount);
+        end
+      else raise ELSOMultiWaitError.Create('TAdvancedEvent.RemoveWaiter: Waiter not found.');
+    end;
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TAdvancedEvent.WasLocked;
+var
+  i:  Integer;
+begin
+// data are expected to be locked by now
+with PLSOAdvancedEvent(fLockPtr)^ do
+  For i := Low(WaiterArray) to Pred(WaiterCount) do
+    InterlockedIncrement(fMultiWaitSlots[WaiterArray[WaiterCount].SlotIndex]^);
+// do not wake the waiter
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TAdvancedEvent.WasUnlocked;
+var
+  i:  Integer;
+begin
+// data are expected to be locked by now
+with PLSOAdvancedEvent(fLockPtr)^ do
+  For i := Low(WaiterArray) to Pred(WaiterCount) do
+    begin
+      If WaiterArray[i].WaitAll then
+        begin
+          If InterlockedDecrement(fMultiWaitSlots[WaiterArray[WaiterCount].SlotIndex]^) <= 0 then
+            FutexWake(fMultiWaitSlots[WaiterArray[WaiterCount].SlotIndex]^,1);
+        end
+      else
+        begin
+          InterlockedDecrement(fMultiWaitSlots[WaiterArray[WaiterCount].SlotIndex]^);
+          FutexWake(fMultiWaitSlots[WaiterArray[WaiterCount].SlotIndex]^,1);
+        end;
+    end;
+end;
+
+{-------------------------------------------------------------------------------
+    TAdvancedEvent - public methods
+-------------------------------------------------------------------------------}
+
+constructor TAdvancedEvent.Create(const Name: String; ManualReset,InitialState: Boolean);
+var
+  InitData: PtrUInt;
+begin
+InitData := 0;
+BitSetTo(InitData,LSO_EVENT_INITDATABIT_STATE,InitialState);
+BitSetTo(InitData,LSO_EVENT_INITDATABIT_MANRESET,ManualReset);
+ProtectedCreate(Name,InitData);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TAdvancedEvent.Create(ManualReset,InitialState: Boolean);
+var
+  InitData: PtrUInt;
+begin
+InitData := 0;
+BitSetTo(InitData,LSO_EVENT_INITDATABIT_STATE,InitialState);
+BitSetTo(InitData,LSO_EVENT_INITDATABIT_MANRESET,ManualReset);
+ProtectedCreate('',InitData);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TAdvancedEvent.Create(const Name: String);
+var
+  InitData: PtrUInt;
+begin
+InitData := 0;
+BTS(InitData,LSO_EVENT_INITDATABIT_MANRESET);
+ProtectedCreate(Name,InitData);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TAdvancedEvent.Create;
+var
+  InitData: PtrUInt;
+begin
+InitData := 0;
+BTS(InitData,LSO_EVENT_INITDATABIT_MANRESET);
+ProtectedCreate('',InitData);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TAdvancedEvent.LockStrict;
+var
+  OrigState:  Boolean;
+begin
+LockData;
+try
+  OrigState := PLSOAdvancedEvent(fLockPtr)^.Signaled;
+  PLSOAdvancedEvent(fLockPtr)^.Signaled := False;
+  If OrigState then
+    WasLocked;
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TAdvancedEvent.Lock: Boolean;
+var
+  OrigState:  Boolean;
+begin
+LockData;
+try
+  OrigState := PLSOAdvancedEvent(fLockPtr)^.Signaled;
+  PLSOAdvancedEvent(fLockPtr)^.Signaled := False;
+  If OrigState then
+    WasLocked;
+  Result := True;
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TAdvancedEvent.UnlockStrict;
+var
+  OrigState:  Boolean;
+begin
+LockData;
+try
+  OrigState := PLSOAdvancedEvent(fLockPtr)^.Signaled;
+  PLSOAdvancedEvent(fLockPtr)^.Signaled := True;
+  If not OrigState then
+    WasUnlocked;
+  If FutexCmpRequeue(PLSOAdvancedEvent(fLockPtr)^.WaitFutex,0,PLSOAdvancedEvent(fLockPtr)^.DataLock,0,MAXINT) < 0 then
+    raise ELSOFutexOpError.Create('TAdvancedEvent.UnlockStrict: Failed to requeue waiters.');
+  SimpleFutexQueue(PLSOAdvancedEvent(fLockPtr)^.DataLock);
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TAdvancedEvent.Unlock: Boolean;
+var
+  OrigState:  Boolean;
+begin
+LockData;
+try
+  OrigState := PLSOAdvancedEvent(fLockPtr)^.Signaled;
+  PLSOAdvancedEvent(fLockPtr)^.Signaled := True;
+  If not OrigState then
+    WasUnlocked;
+  Result := FutexCmpRequeue(PLSOAdvancedEvent(fLockPtr)^.WaitFutex,0,PLSOAdvancedEvent(fLockPtr)^.DataLock,0,MAXINT) >= 0;
+  SimpleFutexQueue(PLSOAdvancedEvent(fLockPtr)^.DataLock);
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TAdvancedEvent.WaitStrict;
+var
+  ExitWait:   Boolean;
+  WaitResult: TFutexWaitResult;
+begin
+LockData;
+try
+  repeat
+    ExitWait := True;
+    If not PLSOAdvancedEvent(fLockPtr)^.Signaled then
+      begin
+        UnlockData;
+        try
+          WaitResult := FutexWait(PLSOAdvancedEvent(fLockPtr)^.WaitFutex,0);
+        finally
+          LockData;
+        end;
+        If WaitResult <> fwrWoken then
+          raise ELSOFutexOpError.CreateFmt('TAdvancedEvent.WaitStrict: ' +
+            'Invalid futex wait result (%d)',[Ord(WaitResult)]);
+      end;
+    If PLSOAdvancedEvent(fLockPtr)^.Signaled then
+      begin
+        If not PLSOAdvancedEvent(fLockPtr)^.ManualReset then
+          begin
+            PLSOAdvancedEvent(fLockPtr)^.Signaled := False;
+            WasLocked;
+          end;
+      end
+    else ExitWait := False;
+  until ExitWait
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TAdvancedEvent.Wait: Boolean;
+var
+  ExitWait:   Boolean;
+  WaitResult: TFutexWaitResult;
+begin
+Result := False;
+LockData;
+try
+  repeat
+    ExitWait := True;
+    If not PLSOAdvancedEvent(fLockPtr)^.Signaled then
+      begin
+        UnlockData;
+        try
+          WaitResult := FutexWait(PLSOAdvancedEvent(fLockPtr)^.WaitFutex,0);
+        finally
+          LockData;
+        end;
+        If WaitResult <> fwrWoken then
+          Break{repeat};
+      end;
+    If PLSOAdvancedEvent(fLockPtr)^.Signaled then
+      begin
+        If not PLSOAdvancedEvent(fLockPtr)^.ManualReset then
+          begin
+            PLSOAdvancedEvent(fLockPtr)^.Signaled := False;
+            WasLocked;
+          end;
+        Result := True;
+      end
+    else ExitWait := False;
+  until ExitWait
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TAdvancedEvent.TryWaitStrict: Boolean;
+begin
+LockData;
+try
+  Result := PLSOAdvancedEvent(fLockPtr)^.Signaled;
+  If not PLSOAdvancedEvent(fLockPtr)^.ManualReset then
+    begin
+      PLSOAdvancedEvent(fLockPtr)^.Signaled := False;
+      If Result then
+        WasLocked;
+    end;
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TAdvancedEvent.TryWait: Boolean;
+begin
+LockData;
+try
+  Result := PLSOAdvancedEvent(fLockPtr)^.Signaled;
+  If not PLSOAdvancedEvent(fLockPtr)^.ManualReset then
+    begin
+      PLSOAdvancedEvent(fLockPtr)^.Signaled := False;
+      If Result then
+        WasLocked;
+    end;
+finally
+  UnlockData;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TAdvancedEvent.TimedWait(Timeout: UInt32): TLSOWaitResult;
+var
+  ExitWait:   Boolean;
+  WaitResult: TFutexWaitResult;
+begin
+// note that time spent in data locking is ignored and is not projected to timeout
+Result := wrError;
+LockData;
+try
+  repeat
+    ExitWait := True;
+    If not PLSOAdvancedEvent(fLockPtr)^.Signaled then
+      begin
+        UnlockData;
+        try
+          WaitResult := FutexWait(PLSOAdvancedEvent(fLockPtr)^.WaitFutex,0,Timeout);
+        finally
+          LockData;
+        end;
+        case WaitResult of
+          fwrWoken:   Result := wrSignaled;
+          fwrTimeout: Result := wrTimeout;
+        else
+          Result := wrError;
+        end;
+      end;
+    If PLSOAdvancedEvent(fLockPtr)^.Signaled then
+      begin
+        If not PLSOAdvancedEvent(fLockPtr)^.ManualReset then
+          begin
+            PLSOAdvancedEvent(fLockPtr)^.Signaled := False;
+            WasLocked;
+          end;
         Result := wrSignaled;
       end
     else If Result <> wrTimeout then
@@ -2513,9 +3137,9 @@ end;
 {$IFDEF FPCDWM}{$PUSH}W5024{$ENDIF}
 procedure TConditionVariableEx.InitializeLock(InitializingData: PtrUInt);
 var
-  MutexAttr:    pthread_mutexattr_t;
-  CondVarAttr:  pthread_condattr_t;
+  MutexAttr:  pthread_mutexattr_t;
 begin
+inherited InitializeLock(InitializingData);
 // data-lock mutex
 If CheckResErr(pthread_mutexattr_init(@MutexAttr)) then
   try
@@ -2533,23 +3157,6 @@ If CheckResErr(pthread_mutexattr_init(@MutexAttr)) then
   end
 else raise ELSOSysInitError.CreateFmt('TConditionVariableEx.InitializeLock: ' +
        'Failed to initialize data-lock mutex attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
-// condition variable
-If CheckResErr(pthread_condattr_init(@CondVarAttr)) then
-  try
-    If fProcessShared then
-      If not CheckResErr(pthread_condattr_setpshared(@CondVarAttr,PTHREAD_PROCESS_SHARED)) then
-        raise ELSOSysOpError.CreateFmt('TConditionVariableEx.InitializeLock: ' +
-          'Failed to set condvar attribute PSHARED (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
-    If not CheckResErr(pthread_cond_init(Addr(PLSOSharedData(fSharedData)^.CondVarEx.CondVar),@CondVarAttr)) then
-      raise ELSOSysInitError.CreateFmt('TConditionVariableEx.InitializeLock: ' +
-        'Failed to initialize condvar (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
-  finally
-    If not CheckResErr(pthread_condattr_destroy(@CondVarAttr)) then
-      raise ELSOSysFinalError.CreateFmt('TConditionVariableEx.InitializeLock: ' +
-        'Failed to destroy condvar attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
-  end
-else raise ELSOSysInitError.CreateFmt('TConditionVariableEx.InitializeLock: ' +
-       'Failed to initialize condvar attributes (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 end;
 {$IFDEF FPCDWM}{$POP}{$ENDIF}
 
@@ -2557,12 +3164,10 @@ end;
 
 procedure TConditionVariableEx.FinalizeLock;
 begin
-If not CheckResErr(pthread_cond_destroy(Addr(PLSOSharedData(fSharedData)^.CondVarEx.CondVar))) then
-  raise ELSOSysFinalError.CreateFmt('TConditionVariableEx.FinalizeLock: ' +
-    'Failed to destroy condvar (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
 If not CheckResErr(pthread_mutex_destroy(Addr(PLSOSharedData(fSharedData)^.CondVarEx.DataLock))) then
   raise ELSOSysFinalError.CreateFmt('TConditionVariableEx.FinalizeLock: ' +
     'Failed to destroy data-lock mutex (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+inherited;
 end;
 
 {-------------------------------------------------------------------------------
@@ -2747,6 +3352,177 @@ If not Result and (ThrErrorCode = PTHREAD_BARRIER_SERIAL_THREAD) then
 else fLastError := Integer(ThrErrorCode);
 end;
 
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                 Wait functions
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    Wait functions - internal functions
+===============================================================================}
+
+Function GetTimeAsMilliseconds: Int64;
+var
+  TimeSpec: TTimeSpec;
+begin
+If CheckErr(clock_gettime(CLOCK_MONOTONIC_RAW,@TimeSpec)) then
+  Result := (((Int64(TimeSpec.tv_sec) * 1000) + (Int64(TimeSpec.tv_nsec) div 1000000))) and (Int64(-1) shr 1)
+else
+  raise ELSOSysOpError.CreateFmt('GetTimeAsMilliseconds: Unable to obtain time (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function WaitForMultipleObjects_Internal(Objects: array of TAdvancedEvent; Timeout: DWORD; WaitAll: Boolean; out Index: Integer): TLSOWaitResult;
+var
+  MultiWaitSlots: TLSOMultiWaitSlots;
+  WaiterFutexIdx: TLSOMultiWaitSlotIndex;
+  WaiterFutexPtr: PFutex;
+  i:              Integer;
+  StartTime:      Int64;
+  CurrTime:       Int64;
+  ExitWait:       Boolean;
+  Counter:        Integer;
+  SigIndex:       Integer;
+begin
+// this function cannot produce usable index
+Index := -1;
+// init waiter futex
+MultiWaitSlots := TLSOMultiWaitSlots.Create;
+try
+  If MultiWaitSlots.GetFreeSlotIndex(WaiterFutexIdx) then
+    try
+      WaiterFutexPtr := MultiWaitSlots[WaiterFutexIdx];
+      WaiterFutexPtr^ := Length(Objects);
+      // add waiter futex to all events
+      For i := Low(Objects) to High(Objects) do
+        Objects[i].AddWaiter(WaiterFutexIdx,WaitAll);
+      try
+        // do the waiting
+        Counter := Length(Objects);
+        repeat
+          ExitWait := True;
+          StartTime := GetTimeAsMilliseconds;
+          If not WaitAll then
+            Counter := Length(Objects);
+          case FutexWait(WaiterFutexPtr^,TFutex(Counter),Timeout) of
+            fwrWoken,
+            fwrValue:   begin
+                          // lock all objects to prevent change in their state
+                          For i := Low(Objects) to High(Objects) do
+                            Objects[i].LockData;
+                          try
+                            If WaitAll then
+                              begin
+                                // check state of all objects
+                                Counter := Length(Objects);
+                                For i := Low(Objects) to High(Objects) do
+                                  If PLSOAdvancedEvent(Objects[i].fLockPtr)^.Signaled then
+                                    Dec(Counter);
+                                // if all are signaled, change state of auto-reset events to locked
+                                If Counter <= 0 then
+                                  begin
+                                    For i := Low(Objects) to High(Objects) do
+                                      If not PLSOAdvancedEvent(Objects[i].fLockPtr)^.ManualReset then
+                                        PLSOAdvancedEvent(Objects[i].fLockPtr)^.Signaled := False;
+                                    Result := wrSignaled;
+                                  end
+                                else ExitWait := False; // spurious wakeup
+                              end
+                            else
+                              begin
+                                // find first signaled event
+                                SigIndex := -1;
+                                For i := Low(Objects) to High(Objects) do
+                                  If PLSOAdvancedEvent(Objects[i].fLockPtr)^.Signaled then
+                                    begin
+                                      SigIndex := i;
+                                      Break{For i};
+                                    end;
+                                If SigIndex >= 0 then
+                                  begin
+                                    If not PLSOAdvancedEvent(Objects[SigIndex].fLockPtr)^.ManualReset then
+                                      PLSOAdvancedEvent(Objects[SigIndex].fLockPtr)^.Signaled := False;
+                                    Index := SigIndex;
+                                    Result := wrSignaled;
+                                  end
+                                else ExitWait := False; // spurious wakeup
+                              end;
+                          finally
+                            // unlock all objects
+                            For i := Low(Objects) to High(Objects) do
+                              Objects[i].UnlockData;
+                          end;
+                        end;
+            fwrTimeout: Result := wrTimeout;
+          else
+            Result := wrError;
+          end;
+          // recalculate timeout
+          If not ExitWait then
+            begin
+              CurrTime := GetTimeAsMilliseconds;
+              If CurrTime > StartTime then
+                begin
+                  If Timeout <= (CurrTime - StartTime) then
+                    begin
+                      Result := wrTimeout;
+                      Break{repeat};
+                    end
+                  else Timeout := Timeout - (CurrTime - StartTime);
+                end;
+            end;
+        until ExitWait;
+      finally
+        // remove waiter futex from all events
+        For i := Low(Objects) to High(Objects) do
+          Objects[i].RemoveWaiter(WaiterFutexIdx);
+      end;
+    finally
+      MultiWaitSlots.InvalidateSlot(WaiterFutexIdx);
+    end
+  else raise ELSOMultiWaitError.Create('WaitForMultipleObjects_Internal: No wait slot available.');
+finally
+  MultiWaitSlots.Free;
+end;
+end;
+
+{===============================================================================
+    Wait functions - public functions
+===============================================================================}
+
+Function WaitForMultipleObjects(Objects: array of TAdvancedEvent; WaitAll: Boolean; Timeout: DWORD; out Index: Integer): TLSOWaitResult;
+begin
+Index := -1;
+If Length(Objects) > 1 then
+   Result := WaitForMultipleObjects_Internal(Objects,Timeout,WaitAll,Index)
+else If Length(Objects) = 1 then
+  begin
+    Result := Objects[0].TimedWait(Timeout);
+    If Result = wrSignaled then
+      Index := 0;
+  end
+else raise ELSOMultiWaitError.CreateFmt('WaitForMultipleObjects: Invalid object count (%d).',[Length(Objects)]);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function WaitForMultipleObjects(Objects: array of TAdvancedEvent; WaitAll: Boolean; Timeout: DWORD): TLSOWaitResult;
+var
+  Index:  Integer;
+begin
+Result := WaitForMultipleObjects(Objects,WaitAll,Timeout,Index);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function WaitForMultipleObjects(Objects: array of TAdvancedEvent; WaitAll: Boolean): TLSOWaitResult;
+var
+  Index:  Integer;
+begin
+Result := WaitForMultipleObjects(Objects,WaitAll,INFINITE,Index);
+end;
 
 {===============================================================================
 --------------------------------------------------------------------------------
