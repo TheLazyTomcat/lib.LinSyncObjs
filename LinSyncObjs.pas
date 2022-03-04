@@ -27,7 +27,7 @@
 
   Version 1.0 alpha (2022-03-01) - requires extensive testing
 
-  Last change 2022-03-01
+  Last change 2022-03-04
 
   ©2022 František Milt
 
@@ -400,17 +400,30 @@ type
     constructor Create(const Name: String); override; // ManualReset := True, InitialState := False
     constructor Create; override;
     procedure LockStrict; virtual;
-    // Lock sets LastError to -1 in case of any failure
+  {
+    Lock sets LastError to -1 in case of any failure.
+    Can raise an exception if internal data lock fails.
+  }
     Function Lock: Boolean; virtual;
     procedure UnlockStrict; virtual;
-    // Unlock sets LastError to -1 in case of any failure
+  {
+    Unlock sets LastError to -1 in case of any failure.
+    Can raise an exception if internal data lock fails.
+  }
     Function Unlock: Boolean; virtual;
     procedure WaitStrict; virtual;
-    // Wait sets LastError to -1 in case of any failure
+  {
+    Wait sets LastError to -1 in case of any failure.
+    Can raise an exception if internal data lock fails.
+  }
     Function Wait: Boolean; virtual;
     Function TryWaitStrict: Boolean; virtual;
-    // TryWait sets LastError to -1 in case of any failure
+  {
+    TryWait sets LastError to -1 in case of any failure.
+    Can raise an exception if internal data lock fails.
+  }
     Function TryWait: Boolean; virtual;
+    // TimedWait can raise an exception if internal data lock fails.
     Function TimedWait(Timeout: UInt32): TLSOWaitResult; virtual;
   end;
 
@@ -1669,19 +1682,19 @@ var
   OrigState:  Boolean;
 begin
 fLastError := -1;
+LockData;
 try
-  LockData;
   try
     OrigState := PLSOEvent(fLockPtr)^.Signaled;
     PLSOEvent(fLockPtr)^.Signaled := False;
     If OrigState then
       WasLocked;
     Result := True;
-  finally
-    UnlockData;
+  except
+    Result := False;
   end;
-except
-  Result := False;
+finally
+  UnlockData;
 end;
 end;
 
@@ -1720,8 +1733,8 @@ var
   OrigState:  Boolean;
 begin
 fLastError := -1;
+LockData;
 try
-  LockData;
   try
     OrigState := PLSOEvent(fLockPtr)^.Signaled;
     PLSOEvent(fLockPtr)^.Signaled := True;
@@ -1729,11 +1742,11 @@ try
       WasUnlocked;
     Result := FutexCmpRequeue(PLSOEvent(fLockPtr)^.WaitFutex,0,PLSOEvent(fLockPtr)^.DataLock,0,MAXINT) >= 0;
     SimpleFutexQueue(PLSOEvent(fLockPtr)^.DataLock);
-  finally
-    UnlockData;
+  except
+    Result := False;
   end;
-except
-  Result := False;
+finally
+  UnlockData;
 end;
 end;
 
@@ -1783,9 +1796,9 @@ var
   WaitResult: TFutexWaitResult;
 begin
 fLastError := -1;
+Result := False;
+LockData;
 try
-  Result := False;
-  LockData;
   try
     repeat
       ExitWait := True;
@@ -1811,11 +1824,11 @@ try
         end
       else ExitWait := False;
     until ExitWait
-  finally
-    UnlockData;
+  except
+    Result := False;
   end;
-except
-  Result := False;
+finally
+  UnlockData;
 end;
 end;
 
@@ -1842,8 +1855,8 @@ end;
 Function TEvent.TryWait: Boolean;
 begin
 fLastError := -1;
+LockData;
 try
-  LockData;
   try
     Result := PLSOEvent(fLockPtr)^.Signaled;
     If not PLSOEvent(fLockPtr)^.ManualReset then
@@ -1852,11 +1865,11 @@ try
         If Result then
           WasLocked;
       end;
-  finally
-    UnlockData;
+  except
+    Result := False;
   end;
-except
-  Result := False;
+finally
+  UnlockData;
 end;
 end;
 
@@ -1868,8 +1881,8 @@ var
   WaitResult: TFutexWaitResult;
 begin
 // note that time spent in data locking is ignored and is not projected to timeout
+LockData;
 try
-  LockData;
   try
     repeat
       ExitWait := True;
@@ -1900,11 +1913,11 @@ try
       else If Result <> wrTimeout then
         ExitWait := False;
     until ExitWait
-  finally
-    UnlockData;
+  except
+    Result := wrError;
   end;
-except
-  Result := wrError;
+finally
+  UnlockData;
 end;
 end;
 
