@@ -25,9 +25,9 @@
     the same name space, so it is not possible for multiple objects of different
     type to have the same name. Names are case sensitive.
 
-  Version 1.0 alpha (2022-03-01) - requires extensive testing
+  Version 1.0 (2022-03-05) - requires extensive testing
 
-  Last change 2022-03-04
+  Last change 2022-03-05
 
   ©2022 František Milt
 
@@ -183,7 +183,8 @@ type
   locked). In that case, LastError is set to 0.
 
   Timed functions will never raise an exception, all errors are indicated by
-  returning wrError result.
+  returning wrError result and error code is stored in LastError. Value of
+  LastError is undefined for results other than wrError.
 }
 {===============================================================================
     TLinSyncObject - public types and constants
@@ -198,9 +199,9 @@ type
 type
   TLSOWaitResult = (wrSignaled,wrTimeout,wrError);
 
-  TLSOLockType = (ltInvalid,ltSpinLock,ltSimpleManualEvent,ltSimpleAutoEvent,
-                  ltEvent,ltAdvancedEvent,ltMutex,ltSemaphore,ltRWLock,
-                  ltCondVar,ltCondVarEx,ltBarrier);
+  TLSOLockType = (ltInvalid,ltSpinLock,ltStatelessEvent,ltSimpleManualEvent,
+                  ltSimpleAutoEvent,ltEvent,ltAdvancedEvent,ltMutex,ltSemaphore,
+                  ltRWLock,ltCondVar,ltCondVarEx,ltBarrier);
 
 {===============================================================================
     TLinSyncObject - class declaration
@@ -301,6 +302,32 @@ type
 
 {===============================================================================
 --------------------------------------------------------------------------------
+                                TStatelessEvent
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TStatelessEvent - class declaration
+===============================================================================}
+type
+  TStatelessEvent = class(TImplementorLinSyncObject)
+  protected
+    class Function GetLockType: TLSOLockType; override;
+    procedure ResolveLockPtr; override;
+    procedure InitializeLock(InitializingData: PtrUInt); override;
+    procedure FinalizeLock; override;
+  public
+    procedure SignalStrict; virtual;
+    // Signal always sets LastError to -1
+    Function Signal: Boolean; virtual;
+    procedure WaitStrict; virtual;
+    // Wait always sets LastError to -1
+    Function Wait: Boolean; virtual;
+    // TimedWait sets LastError to -1 for all results
+    Function TimedWait(Timeout: UInt32): TLSOWaitResult; virtual;
+  end;
+
+{===============================================================================
+--------------------------------------------------------------------------------
                                 TSimpleEventBase
 --------------------------------------------------------------------------------
 ===============================================================================}
@@ -314,12 +341,11 @@ type
     procedure ResolveLockPtr; override;
     procedure InitializeLock(InitializingData: PtrUInt); override;
   public
-    // LockStrict will never raise an exception
     procedure LockStrict; virtual;
-    // Lock always succeeds
+     // Lock always sets LastError to -1
     Function Lock: Boolean; virtual;
     procedure UnlockStrict; virtual;
-    // Unlock sets LastError to -1 in case of any failure
+    // Unlock always sets LastError to -1
     Function Unlock: Boolean; virtual;
     procedure WaitStrict; virtual; abstract;
     Function Wait: Boolean; virtual; abstract;
@@ -342,11 +368,12 @@ type
     class Function GetLockType: TLSOLockType; override;
   public
     procedure WaitStrict; override;
-    // Wait sets LastError to -1 in case of any failure
+    // Wait always sets LastError to -1
     Function Wait: Boolean; override;
-    // TryWaitStrict will never raise an exception
     Function TryWaitStrict: Boolean; override;
+    // TryWait always sets LastError to -1
     Function TryWait: Boolean; override;
+    // TimedWait sets LastError to -1 for all results
     Function TimedWait(Timeout: UInt32): TLSOWaitResult; override;
   end;
 
@@ -366,11 +393,12 @@ type
     class Function GetLockType: TLSOLockType; override;
   public
     procedure WaitStrict; override;
-    // Wait sets LastError to -1 in case of any failure
+    // Wait always sets LastError to -1
     Function Wait: Boolean; override;
-    // TryWaitStrict will never raise an exception
     Function TryWaitStrict: Boolean; override;
+    // TryWait always sets LastError to -1
     Function TryWait: Boolean; override;
+    // TimedWait sets LastError to -1 for all results
     Function TimedWait(Timeout: UInt32): TLSOWaitResult; override;
   end;
 
@@ -401,29 +429,32 @@ type
     constructor Create; override;
     procedure LockStrict; virtual;
   {
-    Lock sets LastError to -1 in case of any failure.
+    Lock always sets LastError to -1.
     Can raise an exception if internal data lock fails.
   }
     Function Lock: Boolean; virtual;
     procedure UnlockStrict; virtual;
   {
-    Unlock sets LastError to -1 in case of any failure.
+    Unlock always sets LastError to -1.
     Can raise an exception if internal data lock fails.
   }
     Function Unlock: Boolean; virtual;
     procedure WaitStrict; virtual;
   {
-    Wait sets LastError to -1 in case of any failure.
+    Wait always sets LastError to -1.
     Can raise an exception if internal data lock fails.
   }
     Function Wait: Boolean; virtual;
     Function TryWaitStrict: Boolean; virtual;
   {
-    TryWait sets LastError to -1 in case of any failure.
+    TryWait always sets LastError to -1.
     Can raise an exception if internal data lock fails.
   }
     Function TryWait: Boolean; virtual;
-    // TimedWait can raise an exception if internal data lock fails.
+  {
+    TimedWait sets LastError to -1 for all results.
+    Can raise an exception if internal data lock fails.
+  }
     Function TimedWait(Timeout: UInt32): TLSOWaitResult; virtual;
   end;
 
@@ -890,6 +921,7 @@ type
     RefCount:       Int32;
     case LockType: TLSOLockType of
       ltSpinLock:         (SpinLock:    pthread_spinlock_t);
+      ltStatelessEvent,
       ltSimpleManualEvent,
       ltSimpleAutoEvent:  (SimpleEvent: TLSOSimpleEvent);
       ltEvent,
@@ -1231,6 +1263,110 @@ end;
 
 {===============================================================================
 --------------------------------------------------------------------------------
+                                TStatelessEvent
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TStatelessEvent - class implementation
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TStatelessEvent - protected methods
+-------------------------------------------------------------------------------}
+
+class Function TStatelessEvent.GetLockType: TLSOLockType;
+begin
+Result := ltStatelessEvent;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TStatelessEvent.ResolveLockPtr;
+begin
+fLockPtr := Addr(PLSOSharedData(fSharedData)^.SimpleEvent.Event);
+end;
+
+//------------------------------------------------------------------------------
+
+{$IFDEF FPCDWM}{$PUSH}W5024{$ENDIF}
+procedure TStatelessEvent.InitializeLock(InitializingData: PtrUInt);
+begin
+InterlockedStore(PLSOSharedData(fSharedData)^.SimpleEvent.Event,0);
+end;
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
+
+//------------------------------------------------------------------------------
+
+procedure TStatelessEvent.FinalizeLock;
+begin
+// no need to do anything
+end;
+
+{-------------------------------------------------------------------------------
+    TStatelessEvent - public methods
+-------------------------------------------------------------------------------}
+
+procedure TStatelessEvent.SignalStrict;
+begin
+FutexWake(PFutex(fLockPtr)^,-1);  // wake everyone
+end;
+
+//------------------------------------------------------------------------------
+
+Function TStatelessEvent.Signal: Boolean;
+begin
+fLastError := -1;
+try
+  FutexWake(PFutex(fLockPtr)^,-1);
+  Result := True;
+except
+  Result := False;;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TStatelessEvent.WaitStrict;
+var
+  FutexWaitResult:  TFutexWaitResult;
+begin
+FutexWaitResult := FutexWait(PFutex(fLockPtr)^,0);
+If FutexWaitResult <> fwrWoken then
+  raise ELSOFutexOpError.CreateFmt('TStatelessEvent.WaitStrict: ' +
+    'Invalid futex wait result (%d).',[Ord(FutexWaitResult)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TStatelessEvent.Wait: Boolean;
+begin
+fLastError := -1;
+try
+  Result := FutexWait(PFutex(fLockPtr)^,0) = fwrWoken;
+except
+  Result := True;
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TStatelessEvent.TimedWait(Timeout: UInt32): TLSOWaitResult;
+begin
+fLastError := -1;
+try
+  case FutexWait(PFutex(fLockPtr)^,0,Timeout) of
+    fwrWoken:   Result := wrSignaled;
+    fwrTimeout: Result := wrTimeout;
+  else
+    Result := wrError;
+  end;
+except
+  Result := wrError;
+end;
+end;
+
+
+{===============================================================================
+--------------------------------------------------------------------------------
                                 TSimpleEventBase
 --------------------------------------------------------------------------------
 ===============================================================================}
@@ -1280,8 +1416,13 @@ end;
 
 Function TSimpleEventBase.Lock: Boolean;
 begin
-InterlockedStore32(fLockPtr,LSO_SIMPLEEVENT_LOCKED);
-Result := True;
+fLastError := -1;
+try
+  InterlockedStore32(fLockPtr,LSO_SIMPLEEVENT_LOCKED);
+  Result := True;
+except
+  Result := False;
+end;
 end;
 
 //------------------------------------------------------------------------------
@@ -1372,7 +1513,12 @@ end;
 
 Function TSimpleManualEvent.TryWait: Boolean;
 begin
-Result := InterlockedLoad32(fLockPtr) = LSO_SIMPLEEVENT_SIGNALED;
+fLastError := -1;
+try
+  Result := InterlockedLoad32(fLockPtr) = LSO_SIMPLEEVENT_SIGNALED;
+except
+  Result := False;
+end;
 end;
 
 //------------------------------------------------------------------------------
@@ -1381,6 +1527,7 @@ Function TSimpleManualEvent.TimedWait(Timeout: UInt32): TLSOWaitResult;
 var
   ExitWait: Boolean;
 begin
+fLastError := -1;
 try
   repeat
     ExitWait := True;
@@ -1493,7 +1640,12 @@ end;
 
 Function TSimpleAutoEvent.TryWait: Boolean;
 begin
-Result := InterlockedExchange32(fLockPtr,LSO_SIMPLEEVENT_LOCKED) = LSO_SIMPLEEVENT_SIGNALED;
+fLastError := -1;
+try
+  Result := InterlockedExchange32(fLockPtr,LSO_SIMPLEEVENT_LOCKED) = LSO_SIMPLEEVENT_SIGNALED;
+except
+  Result := False;
+end;
 end;
 
 //------------------------------------------------------------------------------
@@ -1502,6 +1654,7 @@ Function TSimpleAutoEvent.TimedWait(Timeout: UInt32): TLSOWaitResult;
 var
   ExitWait: Boolean;
 begin
+fLastError := -1;
 try
   repeat
     ExitWait := True;
@@ -1880,7 +2033,7 @@ var
   ExitWait:   Boolean;
   WaitResult: TFutexWaitResult;
 begin
-// note that time spent in data locking is ignored and is not projected to timeout
+fLastError := -1;
 LockData;
 try
   try
