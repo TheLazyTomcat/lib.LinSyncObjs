@@ -25,7 +25,7 @@
     the same name space, so it is not possible for multiple objects of different
     type to have the same name. Names are case sensitive.
 
-  Version 1.0 (2022-03-05) - requires extensive testing
+  Version 1.0 beta (2022-03-05) - requires extensive testing
 
   Last change 2022-03-05
 
@@ -305,6 +305,16 @@ type
                                 TStatelessEvent
 --------------------------------------------------------------------------------
 ===============================================================================}
+{
+  Stateless event does not have any internal state (obviously), so it cannot be
+  locked (non-signaled) or unlocked (signaled).
+
+  When a thread enters waiting on this type of event, it is not waiting for the
+  event to become unlocked (signaled), it waits for some other thread to call
+  method Signal or SignalStrict. When Signal* method is called, all waiting
+  threads are released from waiting. Threads entering wait after this call will
+  again block until next call to Signal*.
+}
 {===============================================================================
     TStatelessEvent - class declaration
 ===============================================================================}
@@ -340,6 +350,7 @@ type
     procedure FinalizeLock; override;
     procedure ResolveLockPtr; override;
     procedure InitializeLock(InitializingData: PtrUInt); override;
+    class Function WakeCount: Integer; virtual; abstract;
   public
     procedure LockStrict; virtual;
      // Lock always sets LastError to -1
@@ -366,6 +377,7 @@ type
   TSimpleManualEvent = class(TSimpleEventBase)
   protected
     class Function GetLockType: TLSOLockType; override;
+    class Function WakeCount: Integer; override;
   public
     procedure WaitStrict; override;
     // Wait always sets LastError to -1
@@ -391,6 +403,7 @@ type
   TSimpleAutoEvent = class(TSimpleEventBase)
   protected
     class Function GetLockType: TLSOLockType; override;
+    class Function WakeCount: Integer; override;
   public
     procedure WaitStrict; override;
     // Wait always sets LastError to -1
@@ -787,6 +800,47 @@ If Result then
   ThrErrorCode := 0
 else
   ThrErrorCode := errno_ptr^;
+end;
+
+//------------------------------------------------------------------------------
+
+Function GetTimeAsMilliseconds: Int64;
+var
+  TimeSpec: TTimeSpec;
+begin
+If CheckErr(clock_gettime(CLOCK_MONOTONIC_RAW,@TimeSpec)) then
+  Result := (((Int64(TimeSpec.tv_sec) * 1000) + (Int64(TimeSpec.tv_nsec) div 1000000))) and (Int64(-1) shr 1)
+else
+  raise ELSOSysOpError.CreateFmt('GetTimeAsMilliseconds: Unable to obtain time (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function RecalculateTimeout(TimeoutFull: UInt32; StartTime: Int64; out TimeoutRemaining: UInt32): Boolean;
+var
+  CurrentTime:  Int64;
+begin
+Result := False;
+TimeoutRemaining := 0;
+If (TimeoutFull = 0) or (TimeoutFull = INFINITE) then
+  begin
+    // full timeout if 0 or infinite
+    TimeoutRemaining := TimeoutFull;
+    Result := True;
+  end
+else
+  begin
+    // arbitrary timeout
+    CurrentTime := GetTimeAsMilliseconds;
+    If CurrentTime >= StartTime then
+      begin
+        If TimeoutFull > UInt32(CurrentTime - StartTime) then
+          begin
+            TimeoutRemaining := TimeoutFull - UInt32(CurrentTime - StartTime);
+            Result := True;
+          end;
+      end;
+  end;
 end;
 
 {===============================================================================
@@ -1431,7 +1485,7 @@ procedure TSimpleEventBase.UnlockStrict;
 begin
 InterlockedStore32(fLockPtr,LSO_SIMPLEEVENT_SIGNALED);
 // wake everyone
-FutexWake(PFutex(fLockPtr)^,-1);
+FutexWake(PFutex(fLockPtr)^,WakeCount);
 end;
 
 //------------------------------------------------------------------------------
@@ -1441,7 +1495,7 @@ begin
 fLastError := -1;
 try
   InterlockedStore32(fLockPtr,LSO_SIMPLEEVENT_SIGNALED);
-  FutexWake(PFutex(fLockPtr)^,-1);
+  FutexWake(PFutex(fLockPtr)^,WakeCount);
   Result := True;
 except
   Result := False;
@@ -1464,6 +1518,13 @@ end;
 class Function TSimpleManualEvent.GetLockType: TLSOLockType;
 begin
 Result := ltSimpleManualEvent;
+end;
+
+//------------------------------------------------------------------------------
+
+class Function TSimpleManualEvent.WakeCount: Integer;
+begin
+Result := -1;
 end;
 
 {-------------------------------------------------------------------------------
@@ -1525,27 +1586,35 @@ end;
 
 Function TSimpleManualEvent.TimedWait(Timeout: UInt32): TLSOWaitResult;
 var
-  ExitWait: Boolean;
+  TimeoutRemaining: UInt32;
+  StartTime:        Int64;
+  ExitWait:         Boolean;
 begin
 fLastError := -1;
 try
+  TimeoutRemaining := Timeout;
+  StartTime := GetTimeAsMilliseconds;
   repeat
     ExitWait := True;
-    case FutexWait(PFutex(fLockPtr)^,LSO_SIMPLEEVENT_LOCKED,Timeout) of
+    case FutexWait(PFutex(fLockPtr)^,LSO_SIMPLEEVENT_LOCKED,TimeoutRemaining) of
     {
       Futex was woken, but that does not necessarily mean it was signaled, so
       check the state.
-      Note that it is possible that the futex was woken with unlocked state, but
-      before it got here, the state changed back to locked.
+      Note that it is possible that the futex was woken with unlocked state,
+      but before it got here, the state changed back to locked.
     }
-      fwrWoken:   If InterlockedLoad32(fLockPtr) = LSO_SIMPLEEVENT_SIGNALED then
-                    Result := wrSignaled
-                  else
-                    ExitWait := False;
+      fwrWoken:   If InterlockedLoad32(fLockPtr) <> LSO_SIMPLEEVENT_SIGNALED then
+                    begin
+                      If RecalculateTimeout(Timeout,StartTime,TimeoutRemaining) then
+                        ExitWait := False
+                      else
+                        Result := wrTimeout;
+                    end
+                  else Result := wrSignaled;
     {
       When fwrValue is returned, it means the futex contained value other than
-      LSO_EVENT_LOCKED, which means it is not locked, and therefore is considered
-      signaled.
+      LSO_EVENT_LOCKED, which means it is not locked, and therefore is
+      considered signaled.
     }
       fwrValue:   Result := wrSignaled;
       fwrTimeout: Result := wrTimeout;
@@ -1574,6 +1643,13 @@ end;
 class Function TSimpleAutoEvent.GetLockType: TLSOLockType;
 begin
 Result := ltSimpleAutoEvent;
+end;
+
+//------------------------------------------------------------------------------
+
+class Function TSimpleAutoEvent.WakeCount: Integer;
+begin
+Result := 1;
 end;
 
 {-------------------------------------------------------------------------------
@@ -1652,19 +1728,27 @@ end;
 
 Function TSimpleAutoEvent.TimedWait(Timeout: UInt32): TLSOWaitResult;
 var
-  ExitWait: Boolean;
+  TimeoutRemaining: UInt32;
+  StartTime:        Int64;
+  ExitWait:         Boolean;
 begin
 fLastError := -1;
 try
+  TimeoutRemaining := Timeout;
+  StartTime := GetTimeAsMilliseconds;
   repeat
     ExitWait := True;
     // lock the event and check what was its original state
     If InterlockedExchange32(fLockPtr,LSO_SIMPLEEVENT_LOCKED) = LSO_SIMPLEEVENT_LOCKED then
       begin
         // event was already locked, enter waiting
-        case FutexWait(PFutex(fLockPtr)^,LSO_SIMPLEEVENT_LOCKED,Timeout) of
+        case FutexWait(PFutex(fLockPtr)^,LSO_SIMPLEEVENT_LOCKED,TimeoutRemaining) of
           fwrWoken,
-          fwrValue:   ExitWait := False;  // event seems to be unlocked, repeat lock cycle
+          fwrValue:   begin
+                        // event seems to be unlocked, repeat lock cycle
+                        RecalculateTimeout(Timeout,StartTime,TimeoutRemaining);
+                        ExitWait := False;
+                      end;
           fwrTimeout: begin
                         // retry locking the event
                         If InterlockedExchange32(fLockPtr,LSO_SIMPLEEVENT_LOCKED) = LSO_SIMPLEEVENT_SIGNALED then
@@ -1866,14 +1950,21 @@ try
 {
   All waitings (FutexWait) are immediately followed by data lock. So if we wake
   any thread, it will just run into locked data lock.
-  To prevent this, we requeue all threads waiting on this event to wait on the
-  data lock. Internal workings of the data lock then takes care of them.
+  To prevent this, we requeue threads waiting on this event to wait on the data
+  lock. Internal workings of the data lock then takes care of them.
 
   No waiting thread is explicitly woken.
 }
-  If FutexCmpRequeue(PLSOEvent(fLockPtr)^.WaitFutex,0,PLSOEvent(fLockPtr)^.DataLock,0,MAXINT) < 0 then
-    raise ELSOFutexOpError.Create('TEvent.UnlockStrict: Failed to requeue waiters.');
-  SimpleFutexQueue(PLSOEvent(fLockPtr)^.DataLock);
+  If PLSOEvent(fLockPtr)^.ManualReset then
+    begin
+      If FutexCmpRequeue(PLSOEvent(fLockPtr)^.WaitFutex,0,PLSOEvent(fLockPtr)^.DataLock,0,-1) < 0 then
+        raise ELSOFutexOpError.Create('TEvent.UnlockStrict: Failed to requeue waiters.');
+    end
+  else
+    begin
+      If FutexCmpRequeue(PLSOEvent(fLockPtr)^.WaitFutex,0,PLSOEvent(fLockPtr)^.DataLock,0,1) < 0 then
+        raise ELSOFutexOpError.Create('TEvent.UnlockStrict: Failed to requeue waiters.');
+    end;
 finally
   UnlockData;
 end;
@@ -1893,8 +1984,10 @@ try
     PLSOEvent(fLockPtr)^.Signaled := True;
     If not OrigState then
       WasUnlocked;
-    Result := FutexCmpRequeue(PLSOEvent(fLockPtr)^.WaitFutex,0,PLSOEvent(fLockPtr)^.DataLock,0,MAXINT) >= 0;
-    SimpleFutexQueue(PLSOEvent(fLockPtr)^.DataLock);
+    If PLSOEvent(fLockPtr)^.ManualReset then
+      Result := FutexCmpRequeue(PLSOEvent(fLockPtr)^.WaitFutex,0,PLSOEvent(fLockPtr)^.DataLock,0,-1) >= 0
+    else
+      Result := FutexCmpRequeue(PLSOEvent(fLockPtr)^.WaitFutex,0,PLSOEvent(fLockPtr)^.DataLock,0,1) >= 0;
   except
     Result := False;
   end;
@@ -2030,20 +2123,24 @@ end;
 
 Function TEvent.TimedWait(Timeout: UInt32): TLSOWaitResult;
 var
-  ExitWait:   Boolean;
-  WaitResult: TFutexWaitResult;
+  TimeoutRemaining: UInt32;
+  StartTime:        Int64;
+  ExitWait:         Boolean;
+  WaitResult:       TFutexWaitResult;
 begin
 fLastError := -1;
 LockData;
 try
   try
+    TimeoutRemaining := Timeout;
+    StartTime := GetTimeAsMilliseconds;
     repeat
       ExitWait := True;
       If not PLSOEvent(fLockPtr)^.Signaled then
         begin
           UnlockData;
           try
-            WaitResult := FutexWait(PLSOEvent(fLockPtr)^.WaitFutex,0,Timeout);
+            WaitResult := FutexWait(PLSOEvent(fLockPtr)^.WaitFutex,0,TimeoutRemaining);
           finally
             LockData;
           end;
@@ -2064,7 +2161,10 @@ try
           Result := wrSignaled;
         end
       else If Result <> wrTimeout then
-        ExitWait := False;
+        begin
+          RecalculateTimeout(Timeout,StartTime,TimeoutRemaining);
+          ExitWait := False;
+        end;
     until ExitWait
   except
     Result := wrError;
@@ -3411,29 +3511,17 @@ end;
     Wait functions - internal functions
 ===============================================================================}
 
-Function GetTimeAsMilliseconds: Int64;
-var
-  TimeSpec: TTimeSpec;
-begin
-If CheckErr(clock_gettime(CLOCK_MONOTONIC_RAW,@TimeSpec)) then
-  Result := (((Int64(TimeSpec.tv_sec) * 1000) + (Int64(TimeSpec.tv_nsec) div 1000000))) and (Int64(-1) shr 1)
-else
-  raise ELSOSysOpError.CreateFmt('GetTimeAsMilliseconds: Unable to obtain time (%d - %s).',[ThrErrorCode,StrError(ThrErrorCode)]);
-end;
-
-//------------------------------------------------------------------------------
-
 Function WaitForMultipleEvents_Internal(Objects: array of TAdvancedEvent; Timeout: DWORD; WaitAll: Boolean; out Index: Integer): TLSOWaitResult;
 var
-  MultiWaitSlots: TLSOMultiWaitSlots;
-  WaiterFutexIdx: TLSOMultiWaitSlotIndex;
-  WaiterFutexPtr: PFutex;
-  i:              Integer;
-  StartTime:      Int64;
-  CurrTime:       Int64;
-  ExitWait:       Boolean;
-  Counter:        Integer;
-  SigIndex:       Integer;
+  TimeoutRemaining: UInt32;
+  StartTime:        Int64;
+  MultiWaitSlots:   TLSOMultiWaitSlots;
+  WaiterFutexIdx:   TLSOMultiWaitSlotIndex;
+  WaiterFutexPtr:   PFutex;
+  i:                Integer;
+  ExitWait:         Boolean;
+  Counter:          Integer;
+  SigIndex:         Integer;
 begin
 // this function cannot produce usable index
 Index := -1;
@@ -3449,13 +3537,14 @@ try
         Objects[i].AddWaiter(WaiterFutexIdx,WaitAll);
       try
         // do the waiting
+        TimeoutRemaining := Timeout;
+        StartTime := GetTimeAsMilliseconds;
         Counter := Length(Objects);
         repeat
           ExitWait := True;
-          StartTime := GetTimeAsMilliseconds;
           If not WaitAll then
             Counter := Length(Objects);
-          case FutexWait(WaiterFutexPtr^,TFutex(Counter),Timeout) of
+          case FutexWait(WaiterFutexPtr^,TFutex(Counter),TimeoutRemaining) of
             fwrWoken,
             fwrValue:   begin
                           // lock all objects to prevent change in their state
@@ -3510,18 +3599,11 @@ try
           end;
           // recalculate timeout
           If not ExitWait then
-            begin
-              CurrTime := GetTimeAsMilliseconds;
-              If CurrTime > StartTime then
-                begin
-                  If Timeout <= (CurrTime - StartTime) then
-                    begin
-                      Result := wrTimeout;
-                      Break{repeat};
-                    end
-                  else Timeout := Timeout - (CurrTime - StartTime);
-                end;
-            end;
+            If not RecalculateTimeout(Timeout,StartTime,TimeoutRemaining) then
+              begin
+                Result := wrTimeout;
+                ExitWait := True;
+              end;
         until ExitWait;
       finally
         // remove waiter futex from all events
