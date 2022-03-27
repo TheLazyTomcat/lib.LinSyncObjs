@@ -27,7 +27,7 @@
 
   Version 1.0 beta (2022-03-05) - requires extensive testing
 
-  Last change 2022-03-05
+  Last change 2022-03-27
 
   ©2022 František Milt
 
@@ -155,9 +155,8 @@ type
   You can also use Open or Create constructors when the object is created as
   process-shared.
   It is possible and permissible to use the same instance in multiple threads
-  of single process, but this practice is highly discouraged as the object
-  fields are not protected against concurrent access (affects eg. LastError
-  property).
+  of single process, but this practice is not recommended as the object fields
+  are not protected against concurrent access (affects eg. LastError property).
 
   To access the object in a different process (object must be created as
   process-shared), use Open or Create constructors using the same name as was
@@ -732,6 +731,18 @@ type
   is set to false and the function returns with result being wrSignaled the
   index will contain zero-based index of object that caused the function to
   return.
+
+  Given the implementation, there are limitations in effect for the following
+  functions, those are:
+
+    - there is a system-wide limit of 15360 concurently running instances of
+      multi-wait (ie. limit of multi-waits active at any one moment)
+
+    - single event object can be waited upon in at most 16 multi-waits at one
+      time
+
+    - the number of events in parameter Objects is not strictly limited, but it
+      is not recommended to go above 32
 }
 
 Function WaitForMultipleEvents(Objects: array of TAdvancedEvent; WaitAll: Boolean; Timeout: DWORD; out Index: Integer): TLSOWaitResult;
