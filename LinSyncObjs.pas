@@ -1812,7 +1812,7 @@ end;
 
 procedure TEvent.InitializeLock(InitializingData: PtrUInt);
 begin
-SimpleFutexInit(PLSOSharedData(fSharedData)^.Event.DataLock);
+SimpleMutexInit(PLSOSharedData(fSharedData)^.Event.DataLock);
 PLSOSharedData(fSharedData)^.Event.WaitFutex := 0;
 LockData;
 try
@@ -1834,14 +1834,14 @@ end;
 
 procedure TEvent.LockData;
 begin
-SimpleFutexLock(PLSOSharedData(fSharedData)^.Event.DataLock);
+SimpleMutexLock(PLSOSharedData(fSharedData)^.Event.DataLock);
 end;
 
 //------------------------------------------------------------------------------
 
 procedure TEvent.UnlockData;
 begin
-SimpleFutexUnlock(PLSOSharedData(fSharedData)^.Event.DataLock);
+SimpleMutexUnlock(PLSOSharedData(fSharedData)^.Event.DataLock);
 end;
 
 //------------------------------------------------------------------------------
