@@ -26,9 +26,9 @@
     share the same name space, so it is not possible for multiple objects of
     different types to have the same name. Names are case sensitive.
 
-  Version 1.0 (2022-07-__) - requires testing (mainly events and multiwait)
+  Version 1.0 (2022-08-01)
 
-  Last change 2022-07-__
+  Last change 2022-08-01
 
   ©2022 František Milt
 
@@ -203,7 +203,7 @@ type
 type
   TLSOWaitResult = (wrSignaled,wrTimeout,wrError);
 
-  // used only internally
+  // TLSOLockType is used only internally
   TLSOLockType = (ltInvalid,ltSpinLock,ltStatelessEvent,ltSimpleManualEvent,
                   ltSimpleAutoEvent,ltEvent,ltMutex,ltSemaphore,ltRWLock,
                   ltCondVar,ltCondVarEx,ltBarrier);
@@ -257,8 +257,7 @@ type
 ===============================================================================}
 {
   TImplementorLinSyncObject is a base class for objects creating a distinct
-  synchronization primitive that is more than a simple wrapper for pthread
-  primitives.
+  synchronization primitive that is not a simple wrapper for pthread primitives.
 }
 {===============================================================================
     TImplementorLinSynObject - class declaration
@@ -439,7 +438,7 @@ type
     Signaled:     Boolean;
     ManualReset:  Boolean;
     WaiterCount:  Integer;
-    WaiterArray:  packed array[0..15] of TLSOWaiterItem;
+    Waiters:      packed array[0..15] of TLSOWaiterItem;
   end;
   PLSOEvent = ^TLSOEvent;
 
@@ -463,7 +462,6 @@ Function event_timedwait(event: PLSOEvent; timeout: cUnsigned): cInt;
 type
   TEvent = class(TImplementorLinSyncObject)
   protected
-    fMultiWaitSlots:  TObject;  //  TLSOMultiWaitSlots (internal class)
     class Function GetLockType: TLSOLockType; override;
     procedure ResolveLockPtr; override;
     procedure InitializeLock(InitializingData: PtrUInt); override;
@@ -746,13 +744,13 @@ type
       is not recommended to go above 32
 }
 
-//Function WaitForMultipleEvents(Objects: array of PLSOEvent; WaitAll: Boolean; Timeout: DWORD; out Index: Integer): TLSOWaitResult;
-//Function WaitForMultipleEvents(Objects: array of PLSOEvent; WaitAll: Boolean; Timeout: DWORD): TLSOWaitResult;
-//Function WaitForMultipleEvents(Objects: array of PLSOEvent; WaitAll: Boolean): TLSOWaitResult;
+Function WaitForMultipleEvents(Objects: array of PLSOEvent; WaitAll: Boolean; Timeout: DWORD; out Index: Integer): TLSOWaitResult;
+Function WaitForMultipleEvents(Objects: array of PLSOEvent; WaitAll: Boolean; Timeout: DWORD): TLSOWaitResult;
+Function WaitForMultipleEvents(Objects: array of PLSOEvent; WaitAll: Boolean): TLSOWaitResult;
 
-//Function WaitForMultipleEvents(Objects: array of TAdvancedEvent; WaitAll: Boolean; Timeout: DWORD; out Index: Integer): TLSOWaitResult;
-//Function WaitForMultipleEvents(Objects: array of TAdvancedEvent; WaitAll: Boolean; Timeout: DWORD): TLSOWaitResult;
-//Function WaitForMultipleEvents(Objects: array of TAdvancedEvent; WaitAll: Boolean): TLSOWaitResult;
+Function WaitForMultipleEvents(Objects: array of TEvent; WaitAll: Boolean; Timeout: DWORD; out Index: Integer): TLSOWaitResult;
+Function WaitForMultipleEvents(Objects: array of TEvent; WaitAll: Boolean; Timeout: DWORD): TLSOWaitResult;
+Function WaitForMultipleEvents(Objects: array of TEvent; WaitAll: Boolean): TLSOWaitResult;
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -768,7 +766,7 @@ Function WaitResultToStr(WaitResult: TLSOWaitResult): String;
 implementation
 
 uses
-  UnixType, Linux, Errors,
+  Math, UnixType, Linux, Errors,
   InterlockedOps, BitOps;
 
 {$IFDEF FPC_DisableWarns}
@@ -1418,15 +1416,15 @@ end;
     TSimpleEventBase - flat interface implementation
 ===============================================================================}
 const
-  LSO_SIMPLEEVENT_LOCKED   = TFutexWord(0);
-  LSO_SIMPLEEVENT_SIGNALED = TFutexWord(1);
+  LSO_EVENTSTATE_LOCKED   = TFutexWord(0);
+  LSO_EVENTSTATE_SIGNALED = TFutexWord(1);
 
 //------------------------------------------------------------------------------
 
 Function _event_simplebase_init(event: PLSOSimpleEvent): cInt;
 begin
 try
-  InterlockedStore(event^.Event,LSO_SIMPLEEVENT_LOCKED);
+  InterlockedStore(event^.Event,LSO_EVENTSTATE_LOCKED);
   Result := 0;
 except
   Result := -1;
@@ -1438,7 +1436,7 @@ end;
 Function _event_simplebase_destroy(event: PLSOSimpleEvent): cInt;
 begin
 try
-  InterlockedStore(event^.Event,LSO_SIMPLEEVENT_LOCKED);
+  InterlockedStore(event^.Event,LSO_EVENTSTATE_LOCKED);
   Result := 0;
 except
   Result := -1;
@@ -1450,7 +1448,7 @@ end;
 Function _event_simplebase_lock(event: PLSOSimpleEvent): cInt;
 begin
 try
-  InterlockedStore(event^.Event,LSO_SIMPLEEVENT_LOCKED);
+  InterlockedStore(event^.Event,LSO_EVENTSTATE_LOCKED);
   // do not wake any threads
   Result := 0;
 except
@@ -1463,7 +1461,7 @@ end;
 Function _event_simplebase_unlock(event: PLSOSimpleEvent; WakeCount: Integer): cInt;
 begin
 try
-  InterlockedStore(event^.Event,LSO_SIMPLEEVENT_SIGNALED);
+  InterlockedStore(event^.Event,LSO_EVENTSTATE_SIGNALED);
   FutexWake(event^.Event,WakeCount);
   Result := 0;
 except
@@ -1585,8 +1583,8 @@ try
   repeat
     Result := 0;
     ExitWait := True;
-    case FutexWait(event^.Event,LSO_SIMPLEEVENT_LOCKED) of
-      fwrWoken:       ExitWait := InterlockedLoad(event^.Event) <> LSO_SIMPLEEVENT_LOCKED;
+    case FutexWait(event^.Event,LSO_EVENTSTATE_LOCKED) of
+      fwrWoken:       ExitWait := InterlockedLoad(event^.Event) <> LSO_EVENTSTATE_LOCKED;
       fwrValue:       ; // the futex vas not locked
       fwrInterrupted: ExitWait := False;
     else
@@ -1603,7 +1601,7 @@ end;
 Function event_manual_trywait(event: PLSOSimpleEvent): cInt;
 begin
 try
-  If InterlockedLoad(event^.Event) <> LSO_SIMPLEEVENT_LOCKED then
+  If InterlockedLoad(event^.Event) <> LSO_EVENTSTATE_LOCKED then
     Result := 0
   else
     Result := ESysEBUSY;
@@ -1625,14 +1623,14 @@ try
   GetTime(StartTime);
   repeat
     ExitWait := True;
-    case FutexWait(event^.Event,LSO_SIMPLEEVENT_LOCKED,TimeoutRemaining) of
+    case FutexWait(event^.Event,LSO_EVENTSTATE_LOCKED,TimeoutRemaining) of
     {
       Futex was woken, but that does not necessarily mean it was signaled, so
       check the state.
       Note that it is possible that the futex was woken with unlocked state,
       but before it got here, the state changed back to locked.
     }
-      fwrWoken:       If InterlockedLoad(event^.Event) = LSO_SIMPLEEVENT_LOCKED then
+      fwrWoken:       If InterlockedLoad(event^.Event) = LSO_EVENTSTATE_LOCKED then
                         begin
                           If RecalculateTimeout(Timeout,StartTime,TimeoutRemaining) then
                             ExitWait := False
@@ -1642,7 +1640,7 @@ try
                       else Result := 0;
     {
       When fwrValue is returned, it means the futex contained value other than
-      LSO_SIMPLEEVENT_LOCKED, which means it is not locked, and therefore is
+      LSO_EVENTSTATE_LOCKED, which means it is not locked, and therefore is
       considered signaled.
     }
       fwrValue:       Result := 0;
@@ -1781,9 +1779,9 @@ try
   repeat
     Result := 0;
     ExitWait := True;
-    case FutexWait(event^.Event,LSO_SIMPLEEVENT_LOCKED) of
+    case FutexWait(event^.Event,LSO_EVENTSTATE_LOCKED) of
       fwrWoken,
-      fwrValue:       ExitWait := InterlockedExchange(event^.Event,LSO_SIMPLEEVENT_LOCKED) <> LSO_SIMPLEEVENT_LOCKED;
+      fwrValue:       ExitWait := InterlockedExchange(event^.Event,LSO_EVENTSTATE_LOCKED) <> LSO_EVENTSTATE_LOCKED;
       fwrInterrupted: ExitWait := False;
     else
       Result := -1;
@@ -1799,7 +1797,7 @@ end;
 Function event_auto_trywait(event: PLSOSimpleEvent): cInt;
 begin
 try
-  If InterlockedExchange(event^.Event,LSO_SIMPLEEVENT_LOCKED) <> LSO_SIMPLEEVENT_LOCKED then
+  If InterlockedExchange(event^.Event,LSO_EVENTSTATE_LOCKED) <> LSO_EVENTSTATE_LOCKED then
     Result := 0
   else
     Result := ESysEBUSY;
@@ -1821,9 +1819,9 @@ try
   GetTime(StartTime);
   repeat
     ExitWait := True;
-    case FutexWait(event^.Event,LSO_SIMPLEEVENT_LOCKED,TimeoutRemaining) of
+    case FutexWait(event^.Event,LSO_EVENTSTATE_LOCKED,TimeoutRemaining) of
       fwrWoken,
-      fwrValue:       If InterlockedExchange(event^.Event,LSO_SIMPLEEVENT_LOCKED) = LSO_SIMPLEEVENT_LOCKED then
+      fwrValue:       If InterlockedExchange(event^.Event,LSO_EVENTSTATE_LOCKED) = LSO_EVENTSTATE_LOCKED then
                         begin
                           If RecalculateTimeout(Timeout,StartTime,TimeoutRemaining) then
                             ExitWait := False
@@ -2090,19 +2088,19 @@ end;
 
 procedure _event_addwaiter(event: PLSOEvent; SlotIndex: TLSOMultiWaitSlotIndex; WaitAll: Boolean);
 begin
-SimpleMutexLock(event^.DataLock);
+_event_lockdata(event);
 try
-  If event^.WaiterCount < Length(event^.WaiterArray) then
+  If event^.WaiterCount < Length(event^.Waiters) then
     begin
-      event^.WaiterArray[event^.WaiterCount].SlotIndex := SlotIndex;
-      event^.WaiterArray[event^.WaiterCount].WaitAll := WaitAll;
+      event^.Waiters[event^.WaiterCount].SlotIndex := SlotIndex;
+      event^.Waiters[event^.WaiterCount].WaitAll := WaitAll;
       If event^.Signaled then
-        InterlockedDecrementIfPositive(GetMultiWaitSlot(event^.WaiterArray[event^.WaiterCount].SlotIndex)^);
+        InterlockedDecrementIfPositive(GetMultiWaitSlot(event^.Waiters[event^.WaiterCount].SlotIndex)^);
       Inc(event^.WaiterCount);
     end
   else raise ELSOMultiWaitError.Create('_event_addwaiter: Waiter list full.');
 finally
-  SimpleMutexUnlock(event^.DataLock);
+  _event_unlockdata(event);
 end;
 end;
 
@@ -2113,12 +2111,12 @@ var
   i:      Integer;
   Index:  Integer;
 begin
-SimpleMutexLock(event^.DataLock);;
+_event_lockdata(event);
 try
   // find the futex
   Index := -1;
-  For i := Low(event^.WaiterArray) to Pred(event^.WaiterCount) do
-    If event^.WaiterArray[i].SlotIndex = SlotIndex then
+  For i := Low(event^.Waiters) to Pred(event^.WaiterCount) do
+    If event^.Waiters[i].SlotIndex = SlotIndex then
       begin
         Index := i;
         Break{For i};
@@ -2127,12 +2125,12 @@ try
   If Index >= 0 then
     begin
       For i := Index to (event^.WaiterCount - 2) do
-        event^.WaiterArray[i] := event^.WaiterArray[i + 1];
+        event^.Waiters[i] := event^.Waiters[i + 1];
       Dec(event^.WaiterCount);
     end
   else raise ELSOMultiWaitError.Create('_event_removewaiter: Waiter not found.');
 finally
-  SimpleMutexUnlock(event^.DataLock); ;
+  _event_unlockdata(event);
 end;
 end;
 
@@ -2143,9 +2141,9 @@ var
   i:  Integer;
 begin
 // data are expected to be locked by now
-For i := Low(event^.WaiterArray) to Pred(event^.WaiterCount) do
-  InterlockedIncrement(GetMultiWaitSlot(event^.WaiterArray[i].SlotIndex)^);
-// do not wake the waiter
+For i := Low(event^.Waiters) to Pred(event^.WaiterCount) do
+  InterlockedIncrement(GetMultiWaitSlot(event^.Waiters[i].SlotIndex)^);
+// do not wake the waiters
 end;
 
 //------------------------------------------------------------------------------
@@ -2155,17 +2153,17 @@ var
   i:  Integer;
 begin
 // data are expected to be locked by now
-For i := Low(event^.WaiterArray) to Pred(event^.WaiterCount) do
+For i := Low(event^.Waiters) to Pred(event^.WaiterCount) do
   begin
-    If event^.WaiterArray[i].WaitAll then
+    If event^.Waiters[i].WaitAll then
       begin
-        If InterlockedDecrementIfPositive(GetMultiWaitSlot(event^.WaiterArray[i].SlotIndex)^) <= 1 then
-          FutexWake(GetMultiWaitSlot(event^.WaiterArray[i].SlotIndex)^,1);
+        If InterlockedDecrementIfPositive(GetMultiWaitSlot(event^.Waiters[i].SlotIndex)^) <= 1 then
+          FutexWake(GetMultiWaitSlot(event^.Waiters[i].SlotIndex)^,1);
       end
     else
       begin
-        InterlockedDecrementIfPositive(GetMultiWaitSlot(event^.WaiterArray[i].SlotIndex)^);
-        FutexWake(GetMultiWaitSlot(event^.WaiterArray[i].SlotIndex)^,1);
+        InterlockedDecrementIfPositive(GetMultiWaitSlot(event^.Waiters[i].SlotIndex)^);
+        FutexWake(GetMultiWaitSlot(event^.Waiters[i].SlotIndex)^,1);
       end;
   end;
 end;
@@ -2178,12 +2176,13 @@ Function event_init(event: PLSOEvent; manual_reset, initial_state: cBool): cInt;
 begin
 try
   FillChar(event^,SizeOf(TLSOEvent),0);
-  SimpleMutexLock(event^.DataLock);
+  SimpleMutexInit(event^.DataLock);
+  _event_lockdata(event);
   try
     event^.ManualReset := manual_reset;
     event^.Signaled := initial_state;
   finally
-    SimpleMutexUnlock(event^.DataLock);
+    _event_unlockdata(event);
   end;
   Result := 0;
 except
@@ -2210,15 +2209,16 @@ var
   OrigState:  Boolean;
 begin
 try
-  SimpleMutexLock(event^.DataLock);
+  _event_lockdata(event);
   try
     OrigState := event^.Signaled;
     event^.Signaled := False;
+    InterlockedStore(event^.WaitFutex,LSO_EVENTSTATE_LOCKED);
     If OrigState then
       _event_gotlocked(event);
     Result := 0;
   finally
-    SimpleMutexUnlock(event^.DataLock);
+    _event_unlockdata(event);
   end;
 except
   Result := -1;
@@ -2230,38 +2230,29 @@ end;
 Function event_unlock(event: PLSOEvent): cInt;
 var
   OrigState:  Boolean;
-
-  Function GetRequeueCount: Integer;
-  begin
-    If event^.ManualReset then
-      Result := -1
-    else
-      Result := 1;
-  end;
-
 begin
 try
-  SimpleMutexLock(event^.DataLock);
+  _event_lockdata(event);
   try
     OrigState := event^.Signaled;
     event^.Signaled := True;
+    InterlockedStore(event^.WaitFutex,LSO_EVENTSTATE_SIGNALED);
     If not OrigState then
       _event_gotunlocked(event);
-    {$message 'rephrase'}
   {
     All waitings (FutexWait) are immediately followed by a data lock. So if we
-    wake more than one thread, it will just run into locked data lock.
-    To prevent this, we requeue threads waiting on this event to wait on the
-    data lock. Internal workings of the data lock then takes care of them.
-
-    No waiting thread is explicitly woken.
+    wake any thread in here, it will just run into locked data lock.
+    To prevent this, we requeue thread(s) waiting on this event to wait on the
+    data lock. As soon as the data lock is unlocked here, one requeued waiter
+    will be woken - it will exit the FutexWait call and will try to acquire the
+    unlocked data lock.
   }
-    If FutexCmpRequeue(event^.WaitFutex,0,event^.DataLock,0,GetRequeueCount) >= 0 then
+    If FutexCmpRequeue(event^.WaitFutex,0,event^.DataLock,0,IfThen(event^.ManualReset,-1,1)) >= 0 then
       Result := 0
     else
       Result := -1;
   finally
-    SimpleMutexUnlock(event^.DataLock);
+    _event_unlockdata(event); // this will wake exactly one requeued waiter (if there is any)
   end;
 except
   Result := -1;
@@ -2276,22 +2267,23 @@ var
   WaitResult: TFutexWaitResult;
 begin
 try
-  SimpleMutexLock(event^.DataLock);
+  _event_lockdata(event);
   try
     repeat
       ExitWait := True;
       If not event^.Signaled then
         begin
-          SimpleMutexUnlock(event^.DataLock);
+          _event_unlockdata(event);
           try
             // do not use FutexWaitNoInt (due to requeueing)
-            WaitResult := FutexWait(event^.WaitFutex,0);
+            WaitResult := FutexWait(event^.WaitFutex,LSO_EVENTSTATE_LOCKED);
           finally
-            SimpleMutexLock(event^.DataLock);
+            _event_lockdata(event);
           end;
           case WaitResult of
-            fwrWoken:       ;                 // do nothing (continues with signaled check)
-            fwrInterrupted: Continue{repeat}; // taken as spurious wakeup, re-enter waiting
+            fwrWoken,
+            fwrValue:       ;                 // do nothing (continues with check of Signaled field)
+            fwrInterrupted: Continue{repeat}; // just re-enter waiting
           else
             Result := -1;
             Break{repeat};
@@ -2302,6 +2294,7 @@ try
           If not event^.ManualReset then
             begin
               event^.Signaled := False;
+              InterlockedStore(event^.WaitFutex,LSO_EVENTSTATE_LOCKED);
               _event_gotlocked(event);
             end;
           Result := 0;
@@ -2309,7 +2302,7 @@ try
       else ExitWait := False;
     until ExitWait;
   finally
-    SimpleMutexUnlock(event^.DataLock);
+    _event_unlockdata(event);
   end;
 except
   Result := -1;
@@ -2321,20 +2314,21 @@ end;
 Function event_trywait(event: PLSOEvent): cInt;
 begin
 try
-  SimpleMutexLock(event^.DataLock);
+  _event_lockdata(event);
   try
     If event^.Signaled then
       begin
         If not event^.ManualReset then
           begin
             event^.Signaled := False;
+            InterlockedStore(event^.WaitFutex,LSO_EVENTSTATE_LOCKED);
             _event_gotlocked(event);
           end;
         Result := 0
       end
     else Result := ESysEBUSY;
   finally
-    SimpleMutexUnlock(event^.DataLock);
+    _event_unlockdata(event);
   end;
 except
   Result := -1;
@@ -2351,29 +2345,30 @@ var
   WaitResult:       TFutexWaitResult;
 begin
 try
-  SimpleMutexLock(event^.DataLock);
+  _event_lockdata(event);
   try
     TimeoutRemaining := Timeout;
     GetTime(StartTime);
     repeat
+      Result := -1;
       ExitWait := True;
       If not event^.Signaled then
         begin
-          SimpleMutexUnlock(event^.DataLock);
+          _event_unlockdata(event);
           try
-            WaitResult := FutexWait(event^.WaitFutex,0,TimeoutRemaining);
+            WaitResult := FutexWait(event^.WaitFutex,LSO_EVENTSTATE_LOCKED,TimeoutRemaining);
           finally
-            SimpleMutexLock(event^.DataLock);
+            _event_lockdata(event);
           end;
           case WaitResult of
-            fwrWoken:       Result := 0;
-            fwrInterrupted: begin
-                              RecalculateTimeout(Timeout,StartTime,TimeoutRemaining);
-                              Continue{repeat};
-                            end;
+            fwrWoken,
+            fwrValue:       ; // do nothing
             fwrTimeout:     Result := ESysETIMEDOUT;
+            fwrInterrupted: If RecalculateTimeout(Timeout,StartTime,TimeoutRemaining) then
+                              Continue{repeat}
+                            else
+                              Result := ESysETIMEDOUT;
           else
-            Result := -1;
             Break{repeat};
           end;
         end;
@@ -2382,18 +2377,21 @@ try
           If not event^.ManualReset then
             begin
               event^.Signaled := False;
+              InterlockedStore(event^.WaitFutex,LSO_EVENTSTATE_LOCKED);
               _event_gotlocked(event);
             end;
           Result := 0;
         end
       else If Result <> ESysETIMEDOUT then
         begin
-          RecalculateTimeout(Timeout,StartTime,TimeoutRemaining);
-          ExitWait := False;
+          If RecalculateTimeout(Timeout,StartTime,TimeoutRemaining) then
+            ExitWait := False
+          else
+            Result := ESysETIMEDOUT;
         end;
     until ExitWait
   finally
-    SimpleMutexUnlock(event^.DataLock);
+    _event_unlockdata(event);
   end;
 except
   Result := -1;
@@ -2475,6 +2473,7 @@ var
   InitData: PtrUInt;
 begin
 InitData := 0;
+BTR(InitData,LSO_EVENT_IDB_STATE);
 BTS(InitData,LSO_EVENT_IDB_MANRESET);
 ProtectedCreate(Name,InitData);
 end;
@@ -2486,6 +2485,7 @@ var
   InitData: PtrUInt;
 begin
 InitData := 0;
+BTR(InitData,LSO_EVENT_IDB_STATE);
 BTS(InitData,LSO_EVENT_IDB_MANRESET);
 ProtectedCreate('',InitData);
 end;
@@ -3799,132 +3799,192 @@ end;
                                  Wait functions
 --------------------------------------------------------------------------------
 ===============================================================================}
+{$message 'add some description'}
 {===============================================================================
     Wait functions - internal functions
 ===============================================================================}
 
 Function WaitForMultipleEvents_Internal(Objects: array of PLSOEvent; Timeout: DWORD; WaitAll: Boolean; out Index: Integer): TLSOWaitResult;
+
+  Function CheckObjects: Boolean;
+  var
+    i,j:  Integer;
+  begin
+    Result := True;
+    // check for nil
+    For i := Low(Objects) to High(Objects) do
+      If not Assigned(Objects[i]) then
+        begin
+          Result := False;
+          Exit;
+        end;
+    // check that there are no duplicates
+    For i := Low(Objects) to Pred(High(Objects)) do
+      For j := Succ(i) to High(Objects) do
+        If Objects[i] = Objects[j] then
+          begin
+            Result := False;
+            Exit;
+          end;
+  end;
+
+//   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---
 var
-  TimeoutRemaining: UInt32;
-  StartTime:        TTimeSpec;
   WaiterFutexIdx:   TLSOMultiWaitSlotIndex;
   WaiterFutexPtr:   PFutex;
   i:                Integer;
-  ExitWait:         Boolean;
+  TimeoutRemaining: UInt32;
+  StartTime:        TTimeSpec;
   Counter:          Integer;
-  SigIndex:         Integer;
+  ExitWait:         Boolean;
+
+//   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---
+
+  procedure ProcessWaitAll;
+  var
+    ii: Integer;
+  begin
+    // check state of all objects
+    Counter := Length(Objects);
+    For ii := Low(Objects) to High(Objects) do
+      If Objects[ii]^.Signaled then
+        Dec(Counter);
+    // if all are signaled, change state of auto-reset events to locked
+    If Counter <= 0 then
+      begin
+        For ii := Low(Objects) to High(Objects) do
+          If not Objects[ii]^.ManualReset then
+            begin
+              Objects[ii]^.Signaled := False;
+              _event_gotlocked(Objects[ii]);
+            end;
+        Result := wrSignaled;
+      end
+    else ExitWait := False; // spurious wakeup
+  end;
+
+//   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---
+
+  procedure ProcessWaitOne;
+  var
+    ii:       Integer;
+    SigIndex: Integer;
+  begin
+    // find first signaled event
+    SigIndex := -1;
+    For ii := Low(Objects) to High(Objects) do
+      If Objects[ii]^.Signaled then
+        begin
+          SigIndex := ii;
+          Break{For i};
+        end;
+    If SigIndex >= 0 then
+      begin
+        If not Objects[SigIndex]^.ManualReset then
+          begin
+            Objects[SigIndex]^.Signaled := False;
+            _event_gotlocked(Objects[SigIndex]);
+          end;
+        Index := SigIndex;
+        Result := wrSignaled;
+      end
+    else ExitWait := False; // spurious wakeup
+  end;
+
+//   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---
+
 begin
 Index := -1;
-If MultiWaitSlots.GetFreeSlotIndex(WaiterFutexIdx) then
-  try
-    // init waiter futex
-    WaiterFutexPtr := MultiWaitSlots[WaiterFutexIdx];
-    WaiterFutexPtr^ := Length(Objects);
-    // add waiter futex to all events
-    For i := Low(Objects) to High(Objects) do
-      _event_addwaiter(Objects[i],WaiterFutexIdx,WaitAll);
-    try
-      // do the waiting
-      TimeoutRemaining := Timeout;
-      GetTime(StartTime);
-      Counter := Length(Objects);
-      repeat
-        ExitWait := True;
-        If not WaitAll then
+If CheckObjects then
+  begin
+    If MultiWaitSlots.GetFreeSlotIndex(WaiterFutexIdx) then
+      try
+        // init waiter futex
+        WaiterFutexPtr := MultiWaitSlots[WaiterFutexIdx];
+        WaiterFutexPtr^ := Length(Objects);
+        // add waiter futex to all events
+        For i := Low(Objects) to High(Objects) do
+          _event_addwaiter(Objects[i],WaiterFutexIdx,WaitAll);
+        try
+          // wait on the waiter futex
+          TimeoutRemaining := Timeout;
+          GetTime(StartTime);
           Counter := Length(Objects);
-        case FutexWait(WaiterFutexPtr^,TFutexWord(Counter),TimeoutRemaining) of
-          fwrWoken,
-          fwrValue:   begin
-                        // lock all objects to prevent change in their state
-                        For i := Low(Objects) to High(Objects) do
-                          _event_lockdata(Objects[i]);
-                        try
-                          If WaitAll then
-                            begin
-                              // check state of all objects
-                              Counter := Length(Objects);
-                              For i := Low(Objects) to High(Objects) do
-                                If Objects[i]^.Signaled then
-                                  Dec(Counter);
-                              // if all are signaled, change state of auto-reset events to locked
-                              If Counter <= 0 then
-                                begin
+          repeat
+            ExitWait := True;
+            If not WaitAll then
+              Counter := Length(Objects);
+            case FutexWait(WaiterFutexPtr^,TFutexWord(Counter),TimeoutRemaining) of
+              fwrWoken,
+              fwrValue:       begin
+                                // lock all objects to prevent change in their state
+                                For i := Low(Objects) to High(Objects) do
+                                  _event_lockdata(Objects[i]);
+                                try
+                                  If WaitAll then
+                                    ProcessWaitAll
+                                  else
+                                    ProcessWaitOne;
+                                finally
+                                  // unlock all objects
                                   For i := Low(Objects) to High(Objects) do
-                                    If not Objects[i]^.ManualReset then
-                                      Objects[i]^.Signaled := False; {$message 'signal other waits?'}
-                                  Result := wrSignaled;
-                                end
-                              else ExitWait := False; // spurious wakeup
-                            end
-                          else
-                            begin
-                              // find first signaled event
-                              SigIndex := -1;
-                              For i := Low(Objects) to High(Objects) do
-                                If Objects[i]^.Signaled then
-                                  begin
-                                    SigIndex := i;
-                                    Break{For i};
-                                  end;
-                              If SigIndex >= 0 then
-                                begin
-                                  If not Objects[i]^.ManualReset then
-                                    Objects[i]^.Signaled := False;
-                                  Index := SigIndex;
-                                  Result := wrSignaled;
-                                end
-                              else ExitWait := False; // spurious wakeup
-                            end;
-                        finally
-                          // unlock all objects
-                          For i := Low(Objects) to High(Objects) do
-                            _event_unlockdata(Objects[i]);
-                        end;
-                      end;
-          fwrTimeout: Result := wrTimeout;
-        else
-          Result := wrError;
-        end;
-        // recalculate timeout
-        If not ExitWait then
-          If not RecalculateTimeout(Timeout,StartTime,TimeoutRemaining) then
-            begin
-              Result := wrTimeout;
-              ExitWait := True;
+                                    _event_unlockdata(Objects[i]);
+                                end;
+                              end;
+              fwrTimeout:     Result := wrTimeout;  // exit with timeout
+              fwrInterrupted: ExitWait := False;    // recalculate timeout and re-enter waiting
+            else
+              Result := wrError;
             end;
-      until ExitWait;
-    finally
-      // remove waiter futex from all events
-      For i := Low(Objects) to High(Objects) do
-        _event_removewaiter(Objects[i],WaiterFutexIdx);
-    end;
-  finally
-    MultiWaitSlots.InvalidateSlot(WaiterFutexIdx);
+            // recalculate timeout if not exiting
+            If not ExitWait then
+              If not RecalculateTimeout(Timeout,StartTime,TimeoutRemaining) then
+                begin
+                  Result := wrTimeout;
+                  ExitWait := True;
+                end;
+          until ExitWait;
+        finally
+          // remove waiter futex from all events
+          For i := Low(Objects) to High(Objects) do
+            _event_removewaiter(Objects[i],WaiterFutexIdx);
+        end;
+      finally
+        // return waiter futex
+        MultiWaitSlots.InvalidateSlot(WaiterFutexIdx);
+      end
+    else raise ELSOMultiWaitError.Create('WaitForMultipleEvents_Internal: No wait slot available.');
   end
-else raise ELSOMultiWaitError.Create('WaitForMultipleEvents_Internal: No wait slot available.');
+else raise ELSOMultiWaitError.Create('WaitForMultipleEvents_Internal: Invalid objects array.');
 end;
 
 {===============================================================================
     Wait functions - public functions
 ===============================================================================}
-(*
-Function WaitForMultipleEvents(Objects: array of TAdvancedEvent; WaitAll: Boolean; Timeout: DWORD; out Index: Integer): TLSOWaitResult;
+
+Function WaitForMultipleEvents(Objects: array of PLSOEvent; WaitAll: Boolean; Timeout: DWORD; out Index: Integer): TLSOWaitResult;
 begin
 Index := -1;
 If Length(Objects) > 1 then
    Result := WaitForMultipleEvents_Internal(Objects,Timeout,WaitAll,Index)
 else If Length(Objects) = 1 then
   begin
-    Result := Objects[0].TimedWait(Timeout);
-    If Result = wrSignaled then
-      Index := 0;
+    Index := 0;
+    If not CheckResErr(event_timedwait(Objects[0],Timeout)) then
+      begin
+        If ThrErrorCode = ESysETIMEDOUT then
+          Result := wrTimeout
+        else
+          Result := wrError;
+      end
+    else Result := wrSignaled;
   end
 else raise ELSOMultiWaitError.CreateFmt('WaitForMultipleEvents: Invalid object count (%d).',[Length(Objects)]);
 end;
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-Function WaitForMultipleEvents(Objects: array of TAdvancedEvent; WaitAll: Boolean; Timeout: DWORD): TLSOWaitResult;
+Function WaitForMultipleEvents(Objects: array of PLSOEvent; WaitAll: Boolean; Timeout: DWORD): TLSOWaitResult;
 var
   Index:  Integer;
 begin
@@ -3933,13 +3993,44 @@ end;
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-Function WaitForMultipleEvents(Objects: array of TAdvancedEvent; WaitAll: Boolean): TLSOWaitResult;
+Function WaitForMultipleEvents(Objects: array of PLSOEvent; WaitAll: Boolean): TLSOWaitResult;
 var
   Index:  Integer;
 begin
 Result := WaitForMultipleEvents(Objects,WaitAll,INFINITE,Index);
 end;
- *)
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function WaitForMultipleEvents(Objects: array of TEvent; WaitAll: Boolean; Timeout: DWORD; out Index: Integer): TLSOWaitResult;
+var
+  TempArr:  array of PLSOEvent;
+  i:        Integer;
+begin
+SetLength(TempArr,Length(Objects));
+For i := Low(Objects) to High(Objects) do
+  TempArr[i] := PLSOEvent(Objects[i].fLockPtr);
+Result := WaitForMultipleEvents_Internal(TempArr,Timeout,WaitAll,Index);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function WaitForMultipleEvents(Objects: array of TEvent; WaitAll: Boolean; Timeout: DWORD): TLSOWaitResult;
+var
+  Index:  Integer;
+begin
+Result := WaitForMultipleEvents(Objects,WaitAll,Timeout,Index);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+Function WaitForMultipleEvents(Objects: array of TEvent; WaitAll: Boolean): TLSOWaitResult;
+var
+  Index:  Integer;
+begin
+Result := WaitForMultipleEvents(Objects,WaitAll,INFINITE,Index);
+end;
+
 {===============================================================================
 --------------------------------------------------------------------------------
                                Utility functions
