@@ -26,9 +26,9 @@
     share the same name space, so it is not possible for multiple objects of
     different types to have the same name. Names are case sensitive.
 
-  Version 1.0 (2022-08-01)
+  Version 1.0 (2022-08-02)
 
-  Last change 2022-08-01
+  Last change 2022-08-02
 
   ©2022 František Milt
 
@@ -741,7 +741,8 @@ type
       time
 
     - the number of events in parameter Objects is not strictly limited, but it
-      is not recommended to go above 32
+      is not recommended to go above 32 (there is a technical limit of about 4
+      bilion objects)
 }
 
 Function WaitForMultipleEvents(Objects: array of PLSOEvent; WaitAll: Boolean; Timeout: DWORD; out Index: Integer): TLSOWaitResult;
@@ -1933,7 +1934,7 @@ type
     fSlotCount:   Integer;
     fSlotMap:     TBitVectorStatic32;
     fSlotMemory:  Pointer;
-    Function GetSlot(SlotIndex: TLSOMultiWaitSlotIndex): PFutex; virtual;
+    Function GetSlot(SlotIndex: TLSOMultiWaitSlotIndex): PFutexWord; virtual;
     procedure Initialize; override;
     procedure Finalize; override;
   public
@@ -1942,7 +1943,7 @@ type
     procedure InvalidateSlot(SlotIndex: TLSOMultiWaitSlotIndex); virtual;
     Function CheckIndex(SlotIndex: TLSOMultiWaitSlotIndex): Boolean; virtual;
     property Count: Integer read fSlotCount;
-    property SlotPtrs[SlotIndex: TLSOMultiWaitSlotIndex]: PFutex read GetSlot; default;
+    property SlotPtrs[SlotIndex: TLSOMultiWaitSlotIndex]: PFutexWord read GetSlot; default;
   end;
 
 {===============================================================================
@@ -1952,10 +1953,10 @@ type
     TLSOMultiWaitSlots - protected methods
 -------------------------------------------------------------------------------}
 
-Function TLSOMultiWaitSlots.GetSlot(SlotIndex: TLSOMultiWaitSlotIndex): PFutex;
+Function TLSOMultiWaitSlots.GetSlot(SlotIndex: TLSOMultiWaitSlotIndex): PFutexWord;
 begin
 If CheckIndex(SlotIndex) then
-  Result := PFutex(PtrAdvance(fSlotMemory,SlotIndex,SizeOf(TFutexWord)))
+  Result := PFutexWord(PtrAdvance(fSlotMemory,SlotIndex,SizeOf(TFutexWord)))
 else
   raise ELSOIndexOutOfBounds.CreateFmt('TLSOMultiWaitSlots.GetSlot: Slot index (%d) out of bounds.',[SlotIndex]);
 end;
@@ -2003,6 +2004,7 @@ begin
 Lock;
 try
   SlotIndex := TLSOMultiWaitSlotIndex(fSlotMap.FirstClean);
+  fSlotMap[SlotIndex] := True;
   Result := CheckIndex(SlotIndex);
 finally
   Unlock;
@@ -2018,7 +2020,7 @@ try
   If CheckIndex(SlotIndex) then
     begin
       fSlotMap[SlotIndex] := False;
-      PFutex(PtrAdvance(fSlotMemory,SlotIndex,SizeOf(TFutexWord)))^ := 0;
+      PFutexWord(PtrAdvance(fSlotMemory,SlotIndex,SizeOf(TFutexWord)))^ := 0;
     end
   else ELSOIndexOutOfBounds.CreateFmt('TLSOMultiWaitSlots.InvalidateSlot: Slot index (%d) out of bounds.',[SlotIndex]);
 finally
@@ -2055,7 +2057,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function GetMultiWaitSlot(SlotIndex: TLSOMultiWaitSlotIndex): PFutex;
+Function GetMultiWaitSlot(SlotIndex: TLSOMultiWaitSlotIndex): PFutexWord;
 begin
 Result := MultiWaitSlots[SlotIndex];
 end;
@@ -2086,8 +2088,9 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure _event_addwaiter(event: PLSOEvent; SlotIndex: TLSOMultiWaitSlotIndex; WaitAll: Boolean);
+Function _event_addwaiter(event: PLSOEvent; SlotIndex: TLSOMultiWaitSlotIndex; WaitAll: Boolean): Boolean;
 begin
+Result := False;
 _event_lockdata(event);
 try
   If event^.WaiterCount < Length(event^.Waiters) then
@@ -2097,8 +2100,8 @@ try
       If event^.Signaled then
         InterlockedDecrementIfPositive(GetMultiWaitSlot(event^.Waiters[event^.WaiterCount].SlotIndex)^);
       Inc(event^.WaiterCount);
-    end
-  else raise ELSOMultiWaitError.Create('_event_addwaiter: Waiter list full.');
+      Result := True;
+    end;
 finally
   _event_unlockdata(event);
 end;
@@ -2106,11 +2109,12 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure _event_removewaiter(event: PLSOEvent; SlotIndex: TLSOMultiWaitSlotIndex);
+Function _event_removewaiter(event: PLSOEvent; SlotIndex: TLSOMultiWaitSlotIndex): Boolean;
 var
   i:      Integer;
   Index:  Integer;
 begin
+Result := False;
 _event_lockdata(event);
 try
   // find the futex
@@ -2127,8 +2131,8 @@ try
       For i := Index to (event^.WaiterCount - 2) do
         event^.Waiters[i] := event^.Waiters[i + 1];
       Dec(event^.WaiterCount);
-    end
-  else raise ELSOMultiWaitError.Create('_event_removewaiter: Waiter not found.');
+      Result := True;
+    end;
 finally
   _event_unlockdata(event);
 end;
@@ -2247,7 +2251,7 @@ try
     will be woken - it will exit the FutexWait call and will try to acquire the
     unlocked data lock.
   }
-    If FutexCmpRequeue(event^.WaitFutex,0,event^.DataLock,0,IfThen(event^.ManualReset,-1,1)) >= 0 then
+    If FutexCmpRequeue(event^.WaitFutex,LSO_EVENTSTATE_SIGNALED,event^.DataLock,0,IfThen(event^.ManualReset,-1,1)) >= 0 then
       Result := 0
     else
       Result := -1;
@@ -3799,7 +3803,28 @@ end;
                                  Wait functions
 --------------------------------------------------------------------------------
 ===============================================================================}
-{$message 'add some description'}
+{
+  Each multi-wait is associated with a futex that is stored in globally shared
+  memory. Since the memory is allocated only once, it has a static size,
+  meaning there is a limit on how many futexes, and therefore concurrently
+  running wait functions, can exist at a time. This limit is currently set to
+  15360 - this number is arbitrary and can be changed in future implementations.
+
+  Each event contains a short list of waiters (or more precisely, references to
+  wait-function-associated futexes) that are waiting on that particular event.
+  Since this list is stored in shared data of the event, it cannot be long,
+  therefore there is a limit of 16 waiters waiting on any particular event.
+
+  Waiting first obtains a free futex, then sets its value to a number of waited
+  objects and adds itself (the obtained futex) to list of waiters in all events.
+  It then enters waiting on the futex.
+
+  Events, when they get locked or unlocked, increase or decrease value of this
+  futex and, depending on its value and whether the waiter waits for all objects
+  or only one, wake the waiter. The waiter then performs necessary checks and
+  other actions on all waited objects an either exits with appropriate result or
+  re-enters waiting. It also removes itself from all events.
+}
 {===============================================================================
     Wait functions - internal functions
 ===============================================================================}
@@ -3831,12 +3856,45 @@ Function WaitForMultipleEvents_Internal(Objects: array of PLSOEvent; Timeout: DW
 //   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---
 var
   WaiterFutexIdx:   TLSOMultiWaitSlotIndex;
-  WaiterFutexPtr:   PFutex;
-  i:                Integer;
+  WaiterFutexPtr:   PFutexWord;
   TimeoutRemaining: UInt32;
   StartTime:        TTimeSpec;
   Counter:          Integer;
   ExitWait:         Boolean;
+
+//   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---
+
+  Function AddSelfToWaiters: Boolean;
+  var
+    ii:         Integer;
+    FailIndex:  Integer;
+  begin
+  {
+    First try to add this waiter to all events.
+    If any addition fails, roll back and return false
+  }
+    Result := True;
+    For ii := Low(Objects) to High(Objects) do
+      If not _event_addwaiter(Objects[ii],WaiterFutexIdx,WaitAll) then
+        begin
+          FailIndex := ii;
+          Result := False;
+          Break{For ii};
+        end;
+    If not Result then
+      For ii := Low(Objects) to Pred(FailIndex) do
+        _event_removewaiter(Objects[ii],WaiterFutexIdx);
+  end;
+
+//   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---
+
+  procedure RemoveSelfFromWaiters;
+  var
+    ii: Integer;
+  begin
+    For ii := Low(Objects) to High(Objects) do
+      _event_removewaiter(Objects[ii],WaiterFutexIdx);
+  end;
 
 //   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---
 
@@ -3856,6 +3914,7 @@ var
           If not Objects[ii]^.ManualReset then
             begin
               Objects[ii]^.Signaled := False;
+              InterlockedStore(Objects[ii]^.WaitFutex,LSO_EVENTSTATE_LOCKED);
               _event_gotlocked(Objects[ii]);
             end;
         Result := wrSignaled;
@@ -3883,12 +3942,34 @@ var
         If not Objects[SigIndex]^.ManualReset then
           begin
             Objects[SigIndex]^.Signaled := False;
+            InterlockedStore(Objects[SigIndex]^.WaitFutex,LSO_EVENTSTATE_LOCKED);
             _event_gotlocked(Objects[SigIndex]);
           end;
         Index := SigIndex;
         Result := wrSignaled;
       end
     else ExitWait := False; // spurious wakeup
+  end;
+
+//   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---
+
+  procedure ProcessEvents;
+  var
+    ii: Integer;
+  begin
+    // lock all objects to prevent change in their state
+    For ii := Low(Objects) to High(Objects) do
+      _event_lockdata(Objects[ii]);
+    try
+      If WaitAll then
+        ProcessWaitAll
+      else
+        ProcessWaitOne;
+    finally
+      // unlock all objects
+      For ii := Low(Objects) to High(Objects) do
+        _event_unlockdata(Objects[ii]);
+    end;
   end;
 
 //   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---   ---
@@ -3901,54 +3982,38 @@ If CheckObjects then
       try
         // init waiter futex
         WaiterFutexPtr := MultiWaitSlots[WaiterFutexIdx];
-        WaiterFutexPtr^ := Length(Objects);
+        InterlockedStore(WaiterFutexPtr^,Length(Objects));
         // add waiter futex to all events
-        For i := Low(Objects) to High(Objects) do
-          _event_addwaiter(Objects[i],WaiterFutexIdx,WaitAll);
-        try
-          // wait on the waiter futex
-          TimeoutRemaining := Timeout;
-          GetTime(StartTime);
-          Counter := Length(Objects);
-          repeat
-            ExitWait := True;
-            If not WaitAll then
-              Counter := Length(Objects);
-            case FutexWait(WaiterFutexPtr^,TFutexWord(Counter),TimeoutRemaining) of
-              fwrWoken,
-              fwrValue:       begin
-                                // lock all objects to prevent change in their state
-                                For i := Low(Objects) to High(Objects) do
-                                  _event_lockdata(Objects[i]);
-                                try
-                                  If WaitAll then
-                                    ProcessWaitAll
-                                  else
-                                    ProcessWaitOne;
-                                finally
-                                  // unlock all objects
-                                  For i := Low(Objects) to High(Objects) do
-                                    _event_unlockdata(Objects[i]);
-                                end;
-                              end;
-              fwrTimeout:     Result := wrTimeout;  // exit with timeout
-              fwrInterrupted: ExitWait := False;    // recalculate timeout and re-enter waiting
-            else
-              Result := wrError;
-            end;
-            // recalculate timeout if not exiting
-            If not ExitWait then
-              If not RecalculateTimeout(Timeout,StartTime,TimeoutRemaining) then
-                begin
-                  Result := wrTimeout;
-                  ExitWait := True;
-                end;
-          until ExitWait;
-        finally
-          // remove waiter futex from all events
-          For i := Low(Objects) to High(Objects) do
-            _event_removewaiter(Objects[i],WaiterFutexIdx);
-        end;
+        If AddSelfToWaiters then
+          try
+            // wait on the waiter futex
+            TimeoutRemaining := Timeout;
+            GetTime(StartTime);
+            Counter := Length(Objects);
+            repeat
+              ExitWait := True;
+              If not WaitAll then
+                Counter := Length(Objects);
+              case FutexWait(WaiterFutexPtr^,TFutexWord(Counter),TimeoutRemaining) of
+                fwrWoken,
+                fwrValue:       ProcessEvents;
+                fwrTimeout:     Result := wrTimeout;  // exit with timeout
+                fwrInterrupted: ExitWait := False;    // recalculate timeout and re-enter waiting
+              else
+                Result := wrError;
+              end;
+              // recalculate timeout if not exiting
+              If not ExitWait then
+                If not RecalculateTimeout(Timeout,StartTime,TimeoutRemaining) then
+                  begin
+                    Result := wrTimeout;
+                    ExitWait := True;
+                  end;
+            until ExitWait;
+          finally
+            // remove waiter futex from all events
+            RemoveSelfFromWaiters;
+          end;
       finally
         // return waiter futex
         MultiWaitSlots.InvalidateSlot(WaiterFutexIdx);
