@@ -26,9 +26,13 @@
     share the same name space, so it is not possible for multiple objects of
     different types to have the same name. Names are case sensitive.
 
-  Version 1.0 (2022-08-02)
+      NOTE - the events and multi-wait were tested, but there may still be some
+             problems. Use them with caution and if you find any bugs, please
+             report them.
 
-  Last change 2022-08-02
+  Version 1.0 (2022-08-05)
+
+  Last change 2022-08-05
 
   ©2022 František Milt
 
@@ -3874,6 +3878,7 @@ var
     If any addition fails, roll back and return false
   }
     Result := True;
+    FailIndex := -1;
     For ii := Low(Objects) to High(Objects) do
       If not _event_addwaiter(Objects[ii],WaiterFutexIdx,WaitAll) then
         begin
@@ -4075,7 +4080,7 @@ begin
 SetLength(TempArr,Length(Objects));
 For i := Low(Objects) to High(Objects) do
   TempArr[i] := PLSOEvent(Objects[i].fLockPtr);
-Result := WaitForMultipleEvents_Internal(TempArr,Timeout,WaitAll,Index);
+Result := WaitForMultipleEvents(TempArr,WaitAll,Timeout,Index);
 end;
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
