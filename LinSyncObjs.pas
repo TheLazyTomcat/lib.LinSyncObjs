@@ -30,9 +30,9 @@
              problems. Use them with caution and if you find any bugs, please
              report them.
 
-  Version 1.0 (2022-08-05)
+  Version 1.0.1 (2022-08-13)
 
-  Last change 2022-08-05
+  Last change 2022-08-13
 
   ©2022 František Milt
 
@@ -107,11 +107,6 @@ type
   ELSOOpenError       = class(ELSOException);
   ELSOInvalidLockType = class(ELSOException);
   ELSOInvalidObject   = class(ELSOException);
-
-  ELSOFutexOpError = class(ELSOException);
-
-  ELSOMultiWaitError   = class(ELSOException);
-  ELSOIndexOutOfBounds = class(ELSOException);
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -1962,7 +1957,7 @@ begin
 If CheckIndex(SlotIndex) then
   Result := PFutexWord(PtrAdvance(fSlotMemory,SlotIndex,SizeOf(TFutexWord)))
 else
-  raise ELSOIndexOutOfBounds.CreateFmt('TLSOMultiWaitSlots.GetSlot: Slot index (%d) out of bounds.',[SlotIndex]);
+  Result := nil;
 end;
 
 //------------------------------------------------------------------------------
@@ -2025,8 +2020,7 @@ try
     begin
       fSlotMap[SlotIndex] := False;
       PFutexWord(PtrAdvance(fSlotMemory,SlotIndex,SizeOf(TFutexWord)))^ := 0;
-    end
-  else ELSOIndexOutOfBounds.CreateFmt('TLSOMultiWaitSlots.InvalidateSlot: Slot index (%d) out of bounds.',[SlotIndex]);
+    end;
 finally
   Unlock;
 end;
@@ -3981,51 +3975,55 @@ var
 
 begin
 Index := -1;
-If CheckObjects then
-  begin
-    If MultiWaitSlots.GetFreeSlotIndex(WaiterFutexIdx) then
-      try
-        // init waiter futex
-        WaiterFutexPtr := MultiWaitSlots[WaiterFutexIdx];
-        InterlockedStore(WaiterFutexPtr^,Length(Objects));
-        // add waiter futex to all events
-        If AddSelfToWaiters then
-          try
-            // wait on the waiter futex
-            TimeoutRemaining := Timeout;
-            GetTime(StartTime);
-            Counter := Length(Objects);
-            repeat
-              ExitWait := True;
-              If not WaitAll then
-                Counter := Length(Objects);
-              case FutexWait(WaiterFutexPtr^,TFutexWord(Counter),TimeoutRemaining) of
-                fwrWoken,
-                fwrValue:       ProcessEvents;
-                fwrTimeout:     Result := wrTimeout;  // exit with timeout
-                fwrInterrupted: ExitWait := False;    // recalculate timeout and re-enter waiting
-              else
-                Result := wrError;
-              end;
-              // recalculate timeout if not exiting
-              If not ExitWait then
-                If not RecalculateTimeout(Timeout,StartTime,TimeoutRemaining) then
-                  begin
-                    Result := wrTimeout;
-                    ExitWait := True;
-                  end;
-            until ExitWait;
-          finally
-            // remove waiter futex from all events
-            RemoveSelfFromWaiters;
-          end;
-      finally
-        // return waiter futex
-        MultiWaitSlots.InvalidateSlot(WaiterFutexIdx);
-      end
-    else raise ELSOMultiWaitError.Create('WaitForMultipleEvents_Internal: No wait slot available.');
-  end
-else raise ELSOMultiWaitError.Create('WaitForMultipleEvents_Internal: Invalid objects array.');
+try
+  If CheckObjects then
+    begin
+      If MultiWaitSlots.GetFreeSlotIndex(WaiterFutexIdx) then
+        try
+          // init waiter futex
+          WaiterFutexPtr := MultiWaitSlots[WaiterFutexIdx];
+          InterlockedStore(WaiterFutexPtr^,Length(Objects));
+          // add waiter futex to all events
+          If AddSelfToWaiters then
+            try
+              // wait on the waiter futex
+              TimeoutRemaining := Timeout;
+              GetTime(StartTime);
+              Counter := Length(Objects);
+              repeat
+                ExitWait := True;
+                If not WaitAll then
+                  Counter := Length(Objects);
+                case FutexWait(WaiterFutexPtr^,TFutexWord(Counter),TimeoutRemaining) of
+                  fwrWoken,
+                  fwrValue:       ProcessEvents;
+                  fwrTimeout:     Result := wrTimeout;  // exit with timeout
+                  fwrInterrupted: ExitWait := False;    // recalculate timeout and re-enter waiting
+                else
+                  Result := wrError;
+                end;
+                // recalculate timeout if not exiting
+                If not ExitWait then
+                  If not RecalculateTimeout(Timeout,StartTime,TimeoutRemaining) then
+                    begin
+                      Result := wrTimeout;
+                      ExitWait := True;
+                    end;
+              until ExitWait;
+            finally
+              // remove waiter futex from all events
+              RemoveSelfFromWaiters;
+            end;
+        finally
+          // return waiter futex
+          MultiWaitSlots.InvalidateSlot(WaiterFutexIdx);
+        end
+      else Result := wrError;
+    end
+  else Result := wrError;
+except
+  Result := wrError;
+end;
 end;
 
 {===============================================================================
@@ -4035,21 +4033,25 @@ end;
 Function WaitForMultipleEvents(Objects: array of PLSOEvent; WaitAll: Boolean; Timeout: DWORD; out Index: Integer): TLSOWaitResult;
 begin
 Index := -1;
-If Length(Objects) > 1 then
-   Result := WaitForMultipleEvents_Internal(Objects,Timeout,WaitAll,Index)
-else If Length(Objects) = 1 then
-  begin
-    Index := 0;
-    If not CheckResErr(event_timedwait(Objects[0],Timeout)) then
-      begin
-        If ThrErrorCode = ESysETIMEDOUT then
-          Result := wrTimeout
-        else
-          Result := wrError;
-      end
-    else Result := wrSignaled;
-  end
-else raise ELSOMultiWaitError.CreateFmt('WaitForMultipleEvents: Invalid object count (%d).',[Length(Objects)]);
+try
+  If Length(Objects) > 1 then
+     Result := WaitForMultipleEvents_Internal(Objects,Timeout,WaitAll,Index)
+  else If Length(Objects) = 1 then
+    begin
+      Index := 0;
+      If not CheckResErr(event_timedwait(Objects[0],Timeout)) then
+        begin
+          If ThrErrorCode = ESysETIMEDOUT then
+            Result := wrTimeout
+          else
+            Result := wrError;
+        end
+      else Result := wrSignaled;
+    end
+  else Result := wrError;
+except
+  Result := wrError;
+end;
 end;
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
