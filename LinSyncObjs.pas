@@ -32,7 +32,7 @@
 
   Version 1.0.2 (2022-08-13)
 
-  Last change 2022-08-13
+  Last change 2022-09-13
 
   ©2022 František Milt
 
@@ -96,7 +96,6 @@ uses
 {===============================================================================
     Library-specific exceptions
 ===============================================================================}
-
 type
   ELSOException = class(Exception);
 
@@ -3311,8 +3310,8 @@ Function TConditionVariable.DoOnPredicateCheck: Boolean;
 begin
 Result := False;
 If Assigned(fOnPredicateCheckEvent) then
-  fOnPredicateCheckEvent(Self,Result);
-If Assigned(fOnPredicateCheckCallback) then
+  fOnPredicateCheckEvent(Self,Result)
+else If Assigned(fOnPredicateCheckCallback) then
   fOnPredicateCheckCallback(Self,Result);
 end;
 
@@ -3324,8 +3323,8 @@ If Assigned(fOnDataAccessEvent) or Assigned(fOnDataAccessCallback) then
   begin
     Result := [];
     If Assigned(fOnDataAccessEvent) then
-      fOnDataAccessEvent(Self,Result);
-    If Assigned(fOnDataAccessCallback) then
+      fOnDataAccessEvent(Self,Result)
+    else If Assigned(fOnDataAccessCallback) then
       fOnDataAccessCallback(Self,Result);
   end
 else Result := [woWakeAll];
