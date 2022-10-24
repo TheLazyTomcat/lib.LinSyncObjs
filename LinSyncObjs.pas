@@ -30,9 +30,9 @@
              problems. Use them with caution and if you find any bugs, please
              report them.
 
-  Version 1.0.2 (2022-08-13)
+  Version 1.0.3 (2022-10-24)
 
-  Last change 2022-09-13
+  Last change 2022-10-24
 
   ©2022 František Milt
 
@@ -1205,6 +1205,13 @@ If SourceObject is Self.ClassType then
             fLastError := 0;
             fName := '';
             fSharedData := SourceObject.fSharedData;
+          {
+            CheckAndSetLockType does not need to be synchronized in any way -
+            it accesses shared memory, but only a field that, since we are
+            duplicating existing object, must already be set and so we are
+            only reading it, nobody have any bussiness changing it by now.
+          }
+            CheckAndSetLockType;
             ResolveLockPtr; // normally called from Initialize
           end
         else raise ELSOInvalidObject.Create('TLinSyncObject.DuplicateFrom: ' +
@@ -3562,6 +3569,7 @@ procedure TConditionVariable.AutoCycle(DataLock: TMutex);
 begin
 AutoCycle(DataLock,INFINITE);
 end;
+
 
 {===============================================================================
 --------------------------------------------------------------------------------
