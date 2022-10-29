@@ -32,7 +32,7 @@
 
   Version 1.0.4 (2022-10-28)
 
-  Last change 2022-10-28
+  Last change 2022-10-29
 
   ©2022 František Milt
 
@@ -1153,7 +1153,7 @@ If Length(Name) > 0 then
     fLastError := 0;
     fName := Name;
     fProcessShared := True;
-    trY
+    try
       fNamedSharedItem := TNamedSharedItem.Create(fName,SizeOf(TLSOSharedData),LSO_SHARED_NAMESPACE);
       fSharedData := fNamedSharedItem.Memory;
       fNamedSharedItem.GlobalLock;
@@ -1194,19 +1194,11 @@ If fProcessShared then
       begin
         fNamedSharedItem.GlobalLock;
         try
-        {
-          Check for RefCount of zero is here because opening (second overload
-          of method Initialize) can fail on uninitialized object (RefCount <= 0)
-          while leaving the counter as is (on 0).
-        }
-          If PLSOSharedData(fSharedData)^.RefCount > 0 then
+          Dec(PLSOSharedData(fSharedData)^.RefCount);
+          If PLSOSharedData(fSharedData)^.RefCount <= 0 then
             begin
-              Dec(PLSOSharedData(fSharedData)^.RefCount);
-              If PLSOSharedData(fSharedData)^.RefCount <= 0 then
-                begin
-                  FinalizeLock;
-                  PLSOSharedData(fSharedData)^.RefCount := 0;
-                end;
+              FinalizeLock;
+              PLSOSharedData(fSharedData)^.RefCount := 0;
             end;
         finally
           fNamedSharedItem.GlobalUnlock;
