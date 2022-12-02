@@ -32,7 +32,7 @@
 
   Version 1.0.4 (2022-10-28)
 
-  Last change 2022-10-29
+  Last change 2022-12-02
 
   ©2022 František Milt
 
@@ -1090,10 +1090,9 @@ fProcessShared := Length(fName) > 0;
 If fProcessShared then
   begin
     try
-      fNamedSharedItem := TNamedSharedItem.Create(fName,SizeOf(TLSOSharedData),LSO_SHARED_NAMESPACE);
-      fSharedData := fNamedSharedItem.Memory;
-      fNamedSharedItem.GlobalLock;
+      fNamedSharedItem := TNamedSharedItem.CreateLocked(fName,SizeOf(TLSOSharedData),LSO_SHARED_NAMESPACE);
       try
+        fSharedData := fNamedSharedItem.Memory;
         Inc(PLSOSharedData(fSharedData)^.RefCount);
         try
           If PLSOSharedData(fSharedData)^.RefCount <= 1 then
@@ -1154,10 +1153,9 @@ If Length(Name) > 0 then
     fName := Name;
     fProcessShared := True;
     try
-      fNamedSharedItem := TNamedSharedItem.Create(fName,SizeOf(TLSOSharedData),LSO_SHARED_NAMESPACE);
-      fSharedData := fNamedSharedItem.Memory;
-      fNamedSharedItem.GlobalLock;
+      fNamedSharedItem := TNamedSharedItem.CreateLocked(fName,SizeOf(TLSOSharedData),LSO_SHARED_NAMESPACE);
       try
+        fSharedData := fNamedSharedItem.Memory;
         Inc(PLSOSharedData(fSharedData)^.RefCount);
         try
           If PLSOSharedData(fSharedData)^.RefCount > 1 then
