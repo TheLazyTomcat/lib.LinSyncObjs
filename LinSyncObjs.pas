@@ -32,7 +32,7 @@
 
   Version 1.0.4 (2022-10-28)
 
-  Last change 2022-12-02
+  Last change 2022-12-04
 
   ©2022 František Milt
 
@@ -1262,7 +1262,7 @@ end;
 constructor TLinSyncObject.DuplicateFrom(SourceObject: TLinSyncObject);
 begin
 inherited Create;
-If SourceObject is Self.ClassType then
+If SourceObject.GetLockType = Self.GetLockType then
   begin
     If not SourceObject.ProcessShared then
       begin
