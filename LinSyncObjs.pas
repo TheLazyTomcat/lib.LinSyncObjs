@@ -1007,6 +1007,12 @@ type
   end;
 
 type
+{
+  Note that type TLSOSharedData has differing sizes in 32bit and 64bit
+  environments, and since the size is used for name of shared memory, this in
+  itself separates those two worlds - so there is no need to explicitly
+  separate 32bit and 64bit process-shared synchronizers.
+}
   TLSOSharedData = record
     SharedUserData: TLSOSharedUserData;
     RefCount:       Int32;
